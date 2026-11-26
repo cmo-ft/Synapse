@@ -17,9 +17,8 @@ model_params:
 
 output_names: [p_signal, p_bkg, p_extconv_bkg]
 loss_function:
-  name: synapse.loss_functions.distillation.DistilledEventCrossEntropy
+  name: synapse.loss_functions.loss.CrossEntropyLossWeighted
   params:
-    teacher_fraction: 0.75
     mean_train_weight: auto
 optimizer: Adam
 start_lr: 0.001

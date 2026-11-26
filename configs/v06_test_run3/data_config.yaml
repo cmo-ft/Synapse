@@ -53,8 +53,6 @@ inputs:
     - dR_j1j2
   obj_4vecs: [px, py, pz, e]
   mask: [valid]
-  # Synapse passes these archived teacher targets to the loss separately from the model inputs.
-  extra_event_info: [evenet_pS, evenet_pB, evenet_pConv, evenet_valid]
 
 # 0 = signal (SM ggF or VBF HH), 1 = bkg, 2 = extconv_bkg.
 labels:

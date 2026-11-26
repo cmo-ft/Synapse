@@ -1,14 +1,21 @@
 import torch
 
+
 class CrossEntropyLossWeighted(torch.nn.Module):
+    """Weight each event's truth cross-entropy and return its class probabilities."""
+
     def __init__(self, **kwargs) -> None:
         super().__init__()
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
 
-    def forward(self, pred, target, weight, **kwargs):
-        ce_loss=self.ce_loss(pred, target)
-        scores = torch.softmax(logits, dim=1)
-        return (ce_loss*weight).sum() / weight.sum(), scores
+    def forward(self, pred, target, weight, mean_train_weight=None, **kwargs):
+        logits = pred[0] if isinstance(pred, (tuple, list)) else pred
+        per_event = self.ce_loss(logits, target)
+        if mean_train_weight is None:
+            mean_train_weight = weight.mean()
+        loss = (weight * per_event).mean() / mean_train_weight
+        return loss, logits.softmax(dim=1)
+
 
 class MyCELoss(torch.nn.Module):
     def __init__(self, **kwargs) -> None:
