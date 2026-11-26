@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from types import NoneType
 from typing import Dict, Any, Type, List
 
+from ..models.shared_parent import DEFAULT_SHARED_PARENT_VETO
 from .tools import flatten_nested_list
 
 class ConfigBase(ABC):
@@ -351,16 +352,52 @@ class ModelConfig(ConfigBase):
         'metrics': (dict, NoneType),
         'output_names': (list, NoneType),
         'binary_object_output_names': list,
-        'relation_outputs': dict,
-        'relation_output_names': list,  # Older recipes listed only the score names here.
+        'shared_parent_outputs': dict,
+        'shared_parent_veto_features': list,
+        'shared_parent_output_names': list,  # Older recipes listed only the score names here.
     }
 
     REQUIRED_KEYS = ['model', 'model_params', 'loss_function', 'start_lr']
+
+    def model_params_for(self, data_config):
+        """Resolve shared-parent veto names against the raw object feature order used for this run."""
+        params = self.model_params.copy()
+        feedback = params.get("shared_parent_feedback")
+        if feedback is True or (isinstance(feedback, dict) and "shared_parent_veto_features" in self):
+            names = self.get("shared_parent_veto_features", DEFAULT_SHARED_PARENT_VETO)
+            features = data_config.inputs["obj_feats"]
+            for name in names:
+                if name not in features:
+                    raise ValueError(f"Shared-parent veto feature {name!r} is missing from inputs.obj_feats")
+            params["shared_parent_feedback"] = {"veto_feature_indices": [features.index(name) for name in names]}
+        return params
+
+    def _upgrade_shared_parent_keys(self):
+        """Read earlier Synapse-dev recipes using the current option names. ROOT branch names are values."""
+        def rename(options, **old_to_new):
+            if not isinstance(options, dict):
+                return
+            for old, new in old_to_new.items():
+                if old in options:
+                    if new in options:
+                        raise ValueError(f"Both {old!r} and {new!r} are set. Use {new!r}.")
+                    options[new] = options.pop(old)
+
+        rename(self._data, relation_outputs="shared_parent_outputs", relation_output_names="shared_parent_output_names")
+        # Model and loss parameters also accept third-party classes with their own keyword names.
+        if self.get("model") == "synapse.models.ParticleTransformer.ParticleTransformerSimple":
+            rename(self.get("model_params"), relation_rank="shared_parent_rank", num_relations="num_shared_parent_types",
+                   relation_feedback="shared_parent_feedback")
+        loss = self.get("loss_function")
+        if isinstance(loss, dict) and loss.get("name") == "synapse.loss_functions.lepton_objects.EventAndLeptonObjectLoss":
+            rename(loss.get("params"), relation_loss_weight="shared_parent_loss_weight",
+                   relation_branches="shared_parent_branches")
 
     def validate(self) -> List[str]:
         """
         Validate model configuration
         """
+        self._upgrade_shared_parent_keys()
         errors = []
 
         # Check required keys
@@ -373,24 +410,33 @@ class ModelConfig(ConfigBase):
         # Auto-set sensible defaults
         self._data.setdefault('lr_scheduler', None)
 
+        veto = self.get("shared_parent_veto_features", [])
+        if isinstance(veto, list) and any(not isinstance(name, str) or not name for name in veto):
+            errors.append("shared_parent_veto_features must contain object feature names")
+
         # Validate values
         if self._data['lr_scheduler']:
             if self._data['lr_scheduler'] not in ['steps', 'cosine', 'one-cycle']:
                 errors.append(f"Not supported learning rate scheduler: {self._data['lr_scheduler']}. "
                               f"Must be one of ['step', 'cosine', 'linear', 'exponential']")
 
-        relations = self.get("relation_outputs")
-        if relations is not None and not errors:
-            if not all(isinstance(name, str) and name for name in (*relations.keys(), *relations.values())):
-                errors.append("relation_outputs must map truth branch names to score branch names")
-            elif len(set(relations.values())) != len(relations):
-                errors.append("Each relation must have its own score branch name")
+        if errors:
+            return errors
+        loss_params = self.loss_function.get("params") or {}
+        if loss_params.get("shared_parent_loss_weight") and "shared_parent_veto_features" in self:
+            loss_params["shared_parent_veto_features"] = veto
+        shared_parent_outputs = self.get("shared_parent_outputs")
+        if shared_parent_outputs is not None:
+            names = (*shared_parent_outputs.keys(), *shared_parent_outputs.values())
+            if not all(isinstance(name, str) and name for name in names):
+                errors.append("shared_parent_outputs must map truth branch names to score branch names")
+            elif len(set(shared_parent_outputs.values())) != len(shared_parent_outputs):
+                errors.append("Each shared-parent matrix must have its own score branch name")
             else:
                 # The head needs only a count. The loss must read truth IDs in that same channel order.
-                self.model_params["num_relations"] = len(relations)
-                loss_params = self.loss_function.get("params") or {}
-                if loss_params.get("relation_loss_weight"):
-                    loss_params["relation_branches"] = list(relations)
+                self.model_params["num_shared_parent_types"] = len(shared_parent_outputs)
+                if loss_params.get("shared_parent_loss_weight"):
+                    loss_params["shared_parent_branches"] = list(shared_parent_outputs)
 
         return errors
 

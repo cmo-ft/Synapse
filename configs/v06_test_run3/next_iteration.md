@@ -1,5 +1,9 @@
 # Next Synapse iteration
 
+## Reconstructed object-type inputs
+
+Consider adding `isLepton` and `isFJets` to `obj_feats`. Use the existing reconstructed electron/muon definition for `isLepton` and the ntuple's forward-jet selection for `isFJets`. Keep `isJet` inclusive of central and forward jets.
+
 ## Per-object ancestry
 
 Study four independent sigmoid outputs per reconstructed lepton or jet, one each for Higgs, top, W and Z ancestry. Use the same transformer tokens as the shared-parent matrices and train both tasks together. A lepton from H → W → ℓ can be positive for both Higgs and W.

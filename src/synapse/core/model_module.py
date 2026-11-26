@@ -7,6 +7,7 @@ import lightning as L
 import torch
 from torch.optim import Adam, AdamW, RAdam
 
+from ..models.shared_parent import DEFAULT_SHARED_PARENT_VETO, shared_parent_object_mask
 from .config import RunConfig
 from .tools import dynamic_import, is_scalar
 from .optimizers import Ranger
@@ -30,7 +31,8 @@ class ModelModule(L.LightningModule):
             metrics: Dict[str, dict] | None = None,
             mean_train_weight: float | None = None,
             binary_object_output_names: list[str] | None = None,
-            relation_output_names: list[str] | None = None,
+            shared_parent_output_names: list[str] | None = None,
+            shared_parent_veto_features: list[str] | None = None,
     ) :
         """
         Initialize LightningModule wrapper.
@@ -50,7 +52,8 @@ class ModelModule(L.LightningModule):
             metrics (dict): Dictionary of metric names and their corresponding functions.
             mean_train_weight (float): Training-fold loss normalization restored from a checkpoint.
             binary_object_output_names (list): Ordered ROOT branch names for the per-object probabilities.
-            relation_output_names (list): Ordered ROOT branch names for the upper-triangle pair probabilities.
+            shared_parent_output_names (list): Ordered ROOT branch names for the upper-triangle pair probabilities.
+            shared_parent_veto_features (list): Object flags that exclude pairs from shared-parent training and scoring.
         """
         super().__init__()
         self.run_cfg = run_cfg
@@ -58,7 +61,7 @@ class ModelModule(L.LightningModule):
             # Older saved recipes kept these names in the run configuration.
             binary_object_output_names = run_cfg.get("binary_object_output_names", [])
         self.binary_object_output_names = binary_object_output_names
-        self.relation_output_names = relation_output_names or []
+        self.shared_parent_output_names = shared_parent_output_names or []
 
         model_cls = dynamic_import(model_class)
 
@@ -68,6 +71,11 @@ class ModelModule(L.LightningModule):
         self.model = model_cls(**model_params)
 
         loss_params = dict(loss_params or {})
+        if shared_parent_veto_features is None:
+            shared_parent_veto_features = loss_params.get("shared_parent_veto_features", DEFAULT_SHARED_PARENT_VETO)
+        elif loss_params.get("shared_parent_loss_weight"):
+            loss_params["shared_parent_veto_features"] = shared_parent_veto_features
+        self.shared_parent_veto_features = tuple(shared_parent_veto_features)
         self._use_fold_mean = loss_params.get("mean_train_weight") == "auto"
         if self._use_fold_mean:
             del loss_params["mean_train_weight"]
@@ -229,15 +237,16 @@ class ModelModule(L.LightningModule):
 
         if stage == "test":
             columns = {k: value.numpy(force=True) for k, value in s.items()}
-            if self.relation_output_names:
+            if self.shared_parent_output_names:
                 matrices = logits_aux["shared_parent_logits"]
                 # Store (0,1), (0,2), ..., (1,2), ... once per symmetric matrix.
                 max_objects = matrices.size(-1)
                 i, j = torch.triu_indices(max_objects, max_objects, offset=1, device=matrices.device)
-                eligible = object_mask[:, 0].bool() & ~s["isMET"].bool()
+                veto_flags = (s[name] for name in self.shared_parent_veto_features)
+                eligible = shared_parent_object_mask(object_mask[:, 0], veto_flags)
                 valid_pairs = eligible[:, i] & eligible[:, j]
                 probabilities = matrices[:, :, i, j].sigmoid().masked_fill(~valid_pairs[:, None, :], -1.)
-                for name, values in zip(self.relation_output_names, probabilities.unbind(1), strict=True):
+                for name, values in zip(self.shared_parent_output_names, probabilities.unbind(1), strict=True):
                     columns[name] = values.numpy(force=True)
             names = self.binary_object_output_names
             if names:

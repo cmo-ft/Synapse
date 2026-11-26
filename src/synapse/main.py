@@ -13,6 +13,7 @@ from synapse.core.logger import EnhancedLogger
 from synapse.core.callbacks import SaveTestOutputs, SaveONNX
 from synapse.core.model_module import ModelModule
 from synapse.core.data_module import DataModule
+from synapse.models.shared_parent import DEFAULT_SHARED_PARENT_VETO
 from synapse.third_party.model_summary import ModelSummary
 
 
@@ -54,21 +55,26 @@ def train(model, model_config, data_config, run_config,
     _logger.info("Set random seed to %d", seed)
     L.seed_everything(seed, workers=True, verbose=False)
 
-    relations = getattr(model_config, "relation_outputs", {})
-    score_names = list(relations.values()) if relations else getattr(model_config, "relation_output_names", None)
+    shared_parent_outputs = getattr(model_config, "shared_parent_outputs", {})
+    veto_features = getattr(model_config, "shared_parent_veto_features", None)
+    model_params = model_config.model_params
+    if model_params.get("shared_parent_feedback"):
+        model_params = model_config.model_params_for(data_config)
+    score_names = (list(shared_parent_outputs.values()) if shared_parent_outputs
+                   else getattr(model_config, "shared_parent_output_names", None))
     loss_params = model_config.loss_function.get("params") or {}
-    if loss_params.get("relation_loss_weight") and "relation_branches" not in loss_params:
+    if loss_params.get("shared_parent_loss_weight") and "shared_parent_branches" not in loss_params:
         # Earlier four-parent recipes listed the truth branches under data labels.objects.
         # The original channel order (Higgs, top, W, Z) was alphabetical regardless of dataset column order.
         branches = sorted(name for name in data_config.labels.get("objects", []) if name.startswith("relation"))
-        loss_params = dict(loss_params, relation_branches=branches)
+        loss_params = dict(loss_params, shared_parent_branches=branches)
     model_args = dict(
-        run_cfg=run_config, model_class=model_config.model, model_params=model_config.model_params,
+        run_cfg=run_config, model_class=model_config.model, model_params=model_params,
         loss_fn=model_config.loss_function['name'], loss_params=loss_params,
         optimizer=model_config.optimizer, start_lr=model_config.start_lr,
         lr_scheduler=model_config.lr_scheduler, metrics=model_config.metrics,
         binary_object_output_names=getattr(model_config, "binary_object_output_names", None),
-        relation_output_names=score_names,
+        shared_parent_output_names=score_names, shared_parent_veto_features=veto_features,
     )
     resume_checkpoint = getattr(run_config, "resume_checkpoint", None)
     if resume_checkpoint and (model_config.load_model or 'train' not in run_config.run_mode):
@@ -81,13 +87,17 @@ def train(model, model_config, data_config, run_config,
             _logger.info("Loading checkpoint %s", initial_checkpoint)
             model = ModelModule.load_from_checkpoint(initial_checkpoint, **model_args)
 
+    # Training needs these named flags for the pair loss. Testing uses them to mask the saved scores.
+    shared_parent_branches = list(shared_parent_outputs)
+    if score_names or loss_params.get("shared_parent_loss_weight"):
+        shared_parent_branches.extend(DEFAULT_SHARED_PARENT_VETO if veto_features is None else veto_features)
     data_module = DataModule(
         data_cfg=data_config,
         run_cfg=run_config,
         train_file_list=train_file_paths,
         val_file_list=val_file_paths,
         test_file_list=test_file_paths,
-        relation_branches=tuple(relations),
+        shared_parent_branches=shared_parent_branches,
     )
 
     tb_logger = TensorBoardLogger(save_dir=run_config.run_dir, name=f"TensorBoardLogs_{run_info_str}")
@@ -174,7 +184,7 @@ def train(model, model_config, data_config, run_config,
             if not checkpoint_path:
                 raise ValueError("Set load_model to the checkpoint to use for a test-only run.")
         _logger.info("Testing checkpoint %s", checkpoint_path)
-        model_args['model_params'] = dict(model_config.model_params, for_inference=True)
+        model_args['model_params'] = dict(model_params, for_inference=True)
         model = ModelModule.load_from_checkpoint(checkpoint_path, **model_args)
         setup_input_norm(model.model, data_module)
         trainer.test(model=model, datamodule=data_module)

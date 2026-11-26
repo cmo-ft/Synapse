@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from .shared_parent import SharedParentHead
+from .shared_parent import SharedParentHead, shared_parent_object_mask
 
 
 @torch.jit.script
@@ -940,15 +940,16 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                  use_amp=False,
                  num_obj_classes=2,
                  lepton_jet_hf=None,
-                 relation_rank=None,
-                 num_relations=4,
+                 shared_parent_rank=None,
+                 num_shared_parent_types=4,
+                 shared_parent_feedback=None,
                  **kwargs) -> None:
         super().__init__(input_dim, global_input_dim, **kwargs)
 
         # Jet candidates and per-object truth IDs need the original slot ordering.
         use_lepton_heads = lepton_jet_hf is not None
         self.trimmer = SequenceTrimmer(
-            enabled=trim and not for_inference and not use_lepton_heads and relation_rank is None
+            enabled=trim and not for_inference and not use_lepton_heads and shared_parent_rank is None
         )
         self.for_inference = for_inference
         self.use_amp = use_amp
@@ -1018,7 +1019,34 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         if use_lepton_heads and self.fc is not None and lepton_jet_hf.get("use_event_context", False):
             # With no eligible lepton–jet pair the context is zero. Omitting the bias keeps its contribution zero.
             self.hf_event_projection = nn.Linear(self.hf_head.context_dim, 2 * embed_dim, bias=False)
-        self.parent_head = SharedParentHead(embed_dim, relation_rank, num_relations) if relation_rank is not None else None
+        self.shared_parent_veto_indices = None
+        feedback_heads = None
+        if shared_parent_feedback is not None and shared_parent_feedback is not False:
+            if shared_parent_rank is None or num_layers < 2:
+                raise ValueError("shared_parent_feedback requires a shared-parent head and at least two object blocks")
+            if not isinstance(shared_parent_feedback, dict):
+                raise ValueError("Use model_config.model_params_for(data_config) to resolve the shared-parent veto features")
+            # Older recipes stored the single MET column directly.
+            indices = shared_parent_feedback.get("veto_feature_indices", [shared_parent_feedback.get("met_feature_index")])
+            if any(not isinstance(i, int) or not 0 <= i < input_dim for i in indices):
+                raise ValueError("Each shared-parent veto index must point to a flag in obj_feats")
+            self.shared_parent_veto_indices = tuple(indices)
+            feedback_heads = cfg_block['num_heads']
+        self.shared_parent_head = None
+        if shared_parent_rank is not None:
+            self.shared_parent_head = SharedParentHead(embed_dim, shared_parent_rank, num_shared_parent_types, feedback_heads)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Earlier Synapse-dev checkpoints stored this head under "parent_head".
+        if self.shared_parent_head is not None:
+            for name in self.shared_parent_head.state_dict():
+                old = prefix + "parent_head." + name
+                new = prefix + "shared_parent_head." + name
+                if old in state_dict and new not in state_dict:
+                    state_dict[new] = state_dict.pop(old)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -1048,10 +1076,17 @@ class ParticleTransformerSimple(_NormalizedTransformer):
             g = self.global_embed(g)
             attn_mask = None
             if (v is not None or uu is not None) and self.pair_embed is not None:
-                attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))  # (N*num_heads, P, P)
+                attn_mask = self.pair_embed(v, uu).flatten(0, 1)  # (N*num_heads, P, P)
 
-            # transform
-            for block in self.blocks:
+            shared_parent_logits = None
+            for index, block in enumerate(self.blocks):
+                if self.shared_parent_veto_indices is not None and index == len(self.blocks) - 1:
+                    # Use the penultimate block's predictions for both the pair loss and the last block's attention.
+                    shared_parent_logits = self.shared_parent_head(x.transpose(0, 1))  # [batch, parent, object, object]
+                    veto_flags = (raw_features[:, i] for i in self.shared_parent_veto_indices)
+                    eligible = shared_parent_object_mask(~padding_mask, veto_flags)
+                    shared_parent_bias = self.shared_parent_head.attention_bias(shared_parent_logits, eligible)
+                    attn_mask = shared_parent_bias if attn_mask is None else attn_mask + shared_parent_bias
                 x = block(x, x_cls=None, x_glob=None, padding_mask=padding_mask, attn_mask=attn_mask)
 
             # extract class token
@@ -1077,7 +1112,9 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                     # Add the pooled jet context to the [CLS, global] features before predicting the event class.
                     x_cls = x_cls + self.hf_event_projection(event_jet_context)
             output = self.fc(x_cls)
-            # The relation matrices are auxiliary predictions from the final object tokens.
-            aux = {"shared_parent_logits": self.parent_head(tokens)} if self.parent_head is not None else None
+            if self.shared_parent_head is not None and shared_parent_logits is None:
+                # Recipes using the matrices only for supervision predict them from the final tokens.
+                shared_parent_logits = self.shared_parent_head(tokens)
+            aux = {"shared_parent_logits": shared_parent_logits} if shared_parent_logits is not None else None
             return output, aux, obj_output.reshape(-1, self.num_obj_classes)
 
