@@ -833,7 +833,9 @@ class ParticleTransformerGlobalFeat(_NormalizedTransformer):
 
 
 class LeptonJetHeavyFlavourHead(nn.Module):
-    """Score each of the three leptons using its possible central-jet partners."""
+    """Predict HF for each lepton and pool its jet context for event classification."""
+
+    context_dim = 48
 
     def __init__(self, embed_dim, jet_tag_indices):
         super().__init__()
@@ -841,11 +843,11 @@ class LeptonJetHeavyFlavourHead(nn.Module):
         self.lepton_proj = nn.Linear(embed_dim, 24)
         self.jet_proj = nn.Linear(embed_dim, 24)
         self.pair_embed = nn.Sequential(
-            nn.Linear(53, 48), nn.LayerNorm(48), nn.GELU(), nn.Linear(48, 48), nn.GELU()
+            nn.Linear(53, 48), nn.LayerNorm(48), nn.GELU(), nn.Linear(48, self.context_dim), nn.GELU()
         )
-        self.pair_rank = nn.Linear(48, 1)
+        self.pair_rank = nn.Linear(self.context_dim, 1)
         self.no_jet = nn.Linear(embed_dim, 1)
-        self.classifier = nn.Sequential(nn.Linear(embed_dim + 48, 32), nn.GELU(), nn.Linear(32, 1))
+        self.classifier = nn.Sequential(nn.Linear(embed_dim + self.context_dim, 32), nn.GELU(), nn.Linear(32, 1))
 
     def forward(self, tokens, features, vectors, valid):
         # tokens has shape [B, P, D] for B events, P object slots and D features per token.
@@ -893,11 +895,20 @@ class LeptonJetHeavyFlavourHead(nn.Module):
         # The classifier maps [B, 3, D + 48] to one HF logit per lepton [B, 3, 1].
         hf = self.classifier(torch.cat((leptons, context), dim=-1))
 
+        # For the event classifier, give more weight to the jet context of leptons with higher HF logits.
+        # This softmax runs over the three leptons. The binary object loss still receives each raw HF logit.
+        valid_leptons = valid[:, :3, None]
+        pool_logits = hf.masked_fill(~valid_leptons, torch.finfo(hf.dtype).min)
+        # A finite minimum keeps softmax defined even for an empty row. Masking again gives it zero weight.
+        lepton_weights = pool_logits.softmax(dim=1).masked_fill(~valid_leptons, 0.)
+        event_jet_context = (lepton_weights * context).sum(dim=1)  # [B, 3, 48] -> [B, 48]
+
         # A logit of -20 gives a near-zero sigmoid probability for missing leptons and nonlepton slots.
-        hf = hf.masked_fill(~valid[:, :3, None], -20.)
+        hf = hf.masked_fill(~valid_leptons, -20.)
         # pad reads axes from the end. (0, 0) keeps the single logit column.
         # (0, P - 3) appends rows after the three leptons, giving [B, P, 1] aligned with the input slots.
-        return nn.functional.pad(hf, (0, 0, 0, tokens.size(1) - leptons.size(1)), value=-20.)
+        hf = nn.functional.pad(hf, (0, 0, 0, tokens.size(1) - leptons.size(1)), value=-20.)
+        return hf, event_jet_context
 
 
 class ParticleTransformerSimple(_NormalizedTransformer):
@@ -996,6 +1007,12 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
         trunc_normal_(self.cls_token, std=.02)
 
+        # Initialize the optional layer last so both configurations start with the same shared weights for a given seed.
+        self.hf_event_projection = None
+        if use_lepton_heads and self.fc is not None and lepton_jet_hf.get("use_event_context", False):
+            # With no eligible lepton–jet pair the context is zero. Omitting the bias keeps its contribution zero.
+            self.hf_event_projection = nn.Linear(self.hf_head.context_dim, 2 * embed_dim, bias=False)
+
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'cls_token', }
@@ -1042,13 +1059,16 @@ class ParticleTransformerSimple(_NormalizedTransformer):
             # fc
             if self.fc is None:
                 return x_cls
-            output = self.fc(x_cls)
             tokens = x.transpose(0, 1)
             obj_output = self.obj_fc(tokens)
             if self.hf_head is not None:
                 if v is None:
                     raise ValueError("The lepton–jet heavy-flavour head requires object four-vectors")
-                hf = self.hf_head(tokens, raw_features, v, mask.squeeze(1))
+                hf, event_jet_context = self.hf_head(tokens, raw_features, v, mask.squeeze(1))
                 obj_output = torch.cat((obj_output, hf), dim=-1)
+                if self.hf_event_projection is not None:
+                    # Add the pooled jet context to the [CLS, global] features before predicting the event class.
+                    x_cls = x_cls + self.hf_event_projection(event_jet_context)
+            output = self.fc(x_cls)
             return output, None, obj_output.reshape(-1, self.num_obj_classes)
 

@@ -18,7 +18,8 @@ class LeptonObjectTests(unittest.TestCase):
         torch.manual_seed(10)
         model = ParticleTransformerSimple(
             input_dim=10, global_input_dim=2, num_classes=3, num_obj_classes=5,
-            lepton_jet_hf={"jet_tag_indices": [8, 9]}, embed_dims=[8], global_embed_dims=[8],
+            lepton_jet_hf={"jet_tag_indices": [8, 9], "use_event_context": True},
+            embed_dims=[8], global_embed_dims=[8],
             pair_embed_dims=[4], num_heads=2, num_layers=1, num_cls_layers=1, fc_params=[[8, 0]],
         )
         model.setup_input_norm(torch.zeros(10), torch.ones(10), torch.zeros(2), torch.ones(2))
@@ -37,7 +38,16 @@ class LeptonObjectTests(unittest.TestCase):
         loss_fn = EventAndLeptonObjectLoss()
         loss_fn.prepare_training_fold(targets, mask, weights)
         pred = model(features, torch.randn(events, 2), vectors, mask)
-        loss, _ = loss_fn(pred, torch.arange(events) % 3, weights, 1., object_targets=targets, object_mask=mask)
+        event_targets = torch.arange(events) % 3
+        # Isolate the event loss so auxiliary supervision cannot account for these gradients.
+        event_loss = torch.nn.functional.cross_entropy(pred[0], event_targets)
+        event_layers = (model.hf_event_projection, model.hf_head.pair_rank, model.hf_head.classifier[-1])
+        grads = torch.autograd.grad(event_loss, [layer.weight for layer in event_layers], retain_graph=True)
+        for grad in grads:
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertTrue(grad.ne(0).any())
+
+        loss, _ = loss_fn(pred, event_targets, weights, 1., object_targets=targets, object_mask=mask)
         loss.backward()
         for layer in (model.obj_fc[-1], model.hf_head.classifier[-1], model.hf_head.pair_rank):
             self.assertTrue(torch.isfinite(layer.weight.grad).all())
@@ -113,16 +123,24 @@ class LeptonObjectTests(unittest.TestCase):
     def test_heavy_flavour_excludes_padded_jets_met_and_forward_slots(self):
         torch.manual_seed(7)
         head = LeptonJetHeavyFlavourHead(8, [8, 9])
-        tokens = torch.randn(2, 12, 8, requires_grad=True)
-        features = torch.randn(2, 10, 12)
-        vectors = torch.randn(2, 4, 12) * 1000
-        valid = torch.ones(2, 12, dtype=torch.bool)
+        tokens = torch.randn(3, 12, 8, requires_grad=True)
+        features = torch.randn(3, 10, 12)
+        vectors = torch.randn(3, 4, 12) * 1000
+        valid = torch.ones(3, 12, dtype=torch.bool)
         valid[0, 3:9] = False  # No central jet for this event.
+        valid[1, 2] = False    # One padded lepton, two valid central jets.
         valid[1, 5:9] = False
-        logits = head(tokens, features, vectors, valid)
+        valid[2, :3] = False   # Jets present, no valid leptons.
+        logits, event_jet_context = head(tokens, features, vectors, valid)
         self.assertTrue(torch.isfinite(logits).all())
         self.assertTrue((logits[:, 3:] == -20).all())
-        logits[:, :3].sum().backward()
+        self.assertTrue((logits[~valid] == -20).all())
+        self.assertEqual(event_jet_context.shape, (3, 48))
+        self.assertTrue(torch.isfinite(event_jet_context).all())
+        self.assertTrue((event_jet_context[[0, 2]] == 0).all())
+        (logits[:, :3].sum() + event_jet_context.sum()).backward()
         self.assertEqual(tokens.grad[0, 3:].count_nonzero().item(), 0)
+        self.assertEqual(tokens.grad[1, 2].count_nonzero().item(), 0)
         self.assertEqual(tokens.grad[1, 5:].count_nonzero().item(), 0)
         self.assertGreater(tokens.grad[1, 3:5].abs().sum().item(), 0)
+        self.assertEqual(tokens.grad[2].count_nonzero().item(), 0)
