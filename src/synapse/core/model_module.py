@@ -30,6 +30,7 @@ class ModelModule(L.LightningModule):
             metrics: Dict[str, dict] | None = None,
             mean_train_weight: float | None = None,
             binary_object_output_names: list[str] | None = None,
+            relation_output_names: list[str] | None = None,
     ) :
         """
         Initialize LightningModule wrapper.
@@ -49,6 +50,7 @@ class ModelModule(L.LightningModule):
             metrics (dict): Dictionary of metric names and their corresponding functions.
             mean_train_weight (float): Training-fold loss normalization restored from a checkpoint.
             binary_object_output_names (list): Ordered ROOT branch names for the per-object probabilities.
+            relation_output_names (list): Ordered ROOT branch names for the upper-triangle pair probabilities.
         """
         super().__init__()
         self.run_cfg = run_cfg
@@ -56,6 +58,7 @@ class ModelModule(L.LightningModule):
             # Older saved recipes kept these names in the run configuration.
             binary_object_output_names = run_cfg.get("binary_object_output_names", [])
         self.binary_object_output_names = binary_object_output_names
+        self.relation_output_names = relation_output_names or []
 
         model_cls = dynamic_import(model_class)
 
@@ -226,12 +229,22 @@ class ModelModule(L.LightningModule):
 
         if stage == "test":
             columns = {k: value.numpy(force=True) for k, value in s.items()}
+            if self.relation_output_names:
+                matrices = logits_aux["shared_parent_logits"]
+                # Store (0,1), (0,2), ..., (1,2), ... once per symmetric matrix.
+                max_objects = matrices.size(-1)
+                i, j = torch.triu_indices(max_objects, max_objects, offset=1, device=matrices.device)
+                eligible = object_mask[:, 0].bool() & ~s["isMET"].bool()
+                valid_pairs = eligible[:, i] & eligible[:, j]
+                probabilities = matrices[:, :, i, j].sigmoid().masked_fill(~valid_pairs[:, None, :], -1.)
+                for name, values in zip(self.relation_output_names, probabilities.unbind(1), strict=True):
+                    columns[name] = values.numpy(force=True)
             names = self.binary_object_output_names
             if names:
-                batch_size, _, slots = object_mask.shape
-                if obj_logits.shape != (batch_size * slots, len(names)):
-                    raise ValueError("Object logits must match the configured names and original object slots")
-                probs = obj_logits.reshape(batch_size, slots, len(names)).sigmoid().numpy(force=True)
+                batch_size, _, max_objects = object_mask.shape
+                if obj_logits.shape != (batch_size * max_objects, len(names)):
+                    raise ValueError("Object logits must match the configured names and padded input dimensions")
+                probs = obj_logits.reshape(batch_size, max_objects, len(names)).sigmoid().numpy(force=True)
                 columns.update({name: probs[:, :, i] for i, name in enumerate(names)})
             return {
                 "loss": loss,

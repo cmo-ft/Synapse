@@ -15,6 +15,7 @@ class DataModule(L.LightningDataModule):
             train_file_list: list[str] | None = None,
             val_file_list: list[str] | None = None,
             test_file_list: list[str] | None = None,
+            relation_branches=(),
     ):
         super().__init__()
         self.val_dataset = None
@@ -26,6 +27,12 @@ class DataModule(L.LightningDataModule):
         self.train_data_cfg = copy.deepcopy(data_cfg)
         self.val_data_cfg = copy.deepcopy(data_cfg)
         self.test_data_cfg = copy.deepcopy(data_cfg)
+
+        if relation_branches:
+            # Read the parent IDs as training truth and copy their original values to the test output.
+            objects = self.train_data_cfg.labels.get("objects", [])
+            self.train_data_cfg.labels["objects"] = list(dict.fromkeys([*objects, *relation_branches]))
+            self.test_data_cfg.spectators = list(dict.fromkeys([*self.test_data_cfg.spectators, *relation_branches]))
 
         if run_cfg.cross_validation and run_cfg.cross_validation_var and data_cfg.train_selection:
             self.train_data_cfg.selection = data_cfg.train_selection

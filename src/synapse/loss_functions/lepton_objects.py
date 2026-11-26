@@ -4,6 +4,28 @@ from torch.nn import functional as F
 from .loss import CrossEntropyLossWeighted
 
 
+def _relation_ids(targets, valid, branches, rows=slice(None)):
+    """Return [events, parents, max_objects] truth IDs, with padding and MET marked unknown."""
+    ids = torch.stack([torch.as_tensor(targets[name][rows]) for name in branches], dim=1)
+    eligible = valid & ~torch.as_tensor(targets["isMET"][rows]).bool()
+    return ids.masked_fill(~eligible[:, None, :], -1)
+
+
+def shared_parent_bce(logits, ids):
+    """Average binary cross-entropy over known unordered pairs in each event, separately for each parent."""
+    max_objects = ids.size(-1)
+    if logits.shape != (*ids.shape, max_objects):
+        raise ValueError("Expected one square matrix per event and parent, aligned with the truth IDs")
+    # Select i < j before building the targets. This skips self-pairs and counts (i, j) only once.
+    i, j = torch.triu_indices(max_objects, max_objects, offset=1, device=ids.device)
+    first, second = ids[:, :, i], ids[:, :, j]
+    known = (first >= 0) & (second >= 0)
+    # Equal positive IDs identify the same parent in this event. Zero is a confirmed nonmember.
+    same = (first > 0) & (first == second)
+    loss = F.binary_cross_entropy_with_logits(logits[:, :, i, j], same.to(logits.dtype), reduction="none")
+    return loss.masked_fill(~known, 0).sum(-1) / known.sum(-1).clamp_min(1)  # [events, parents]
+
+
 def _fold_chunks(n_events):
     # At 10 slots, a float64 [events, slots, 3 origins] product takes 480 MB for 2M events.
     # Each chunk needs about 16 MB for that product. The sums accumulate over the whole fold.
@@ -13,17 +35,23 @@ def _fold_chunks(n_events):
 
 
 class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
-    """Event truth CE plus binary origin, conversion and heavy-flavour losses during training."""
+    """Event truth CE with per-object and optional shared-parent supervision during training."""
 
     def __init__(self, origin_loss_weight=0.10, conversion_loss_weight=0.10,
-                 heavy_flavour_weight=0.08, balance_origin_classes=True):
-        """Set how much the origin, conversion and heavy-flavour losses contribute to training."""
+                 heavy_flavour_weight=0.08, balance_origin_classes=True, relation_loss_weight=0.0,
+                 relation_branches=()):
+        """Set each auxiliary loss coefficient. relation_loss_weight applies to each parent separately."""
         super().__init__()
-        if min(origin_loss_weight, conversion_loss_weight, heavy_flavour_weight) < 0:
+        if min(origin_loss_weight, conversion_loss_weight, heavy_flavour_weight, relation_loss_weight) < 0:
             raise ValueError("Object loss weights must be nonnegative")
         self.origin_loss_weight = origin_loss_weight
         self.conversion_loss_weight = conversion_loss_weight
         self.heavy_flavour_weight = heavy_flavour_weight
+        self.relation_loss_weight = relation_loss_weight
+        self.relation_branches = tuple(relation_branches)
+        if relation_loss_weight and not self.relation_branches:
+            raise ValueError("The relation loss needs at least one configured truth branch")
+        self.relation_factors = torch.ones(len(self.relation_branches))
         # Rows hold negative and positive weights. Columns correspond to Higgs, top and W/Z/VV.
         self.origin_class_weights = torch.ones(2, 3) if balance_origin_classes else None
         self.mean_valid_slots = None  # Fitted on the training fold, including when resuming.
@@ -40,7 +68,7 @@ class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
 
     @torch.no_grad()
     def prepare_training_fold(self, targets, mask, event_weights):
-        """Fit the object-loss normalization and optional origin class weights in one pass.
+        """Fit object, origin and shared-parent loss normalizations in one pass.
 
         All valid objects enter the normalization. Each origin head balances its positive
         and negative reconstructed leptons using sums of training event weights (SOW).
@@ -51,6 +79,7 @@ class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
         object_sow = 0.0
         positive_sow = event_weights.new_zeros(3)
         negative_sow = torch.zeros_like(positive_sow)
+        relation_sow = event_weights.new_zeros(len(self.relation_branches))
 
         for rows in _fold_chunks(len(event_weights)):
             weights = event_weights[rows]
@@ -62,6 +91,12 @@ class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
             object_weights = weights[:, None] * valid
             event_sow += weights.sum()
             object_sow += object_weights.sum()
+
+            if self.relation_loss_weight:
+                ids = _relation_ids(targets, valid, self.relation_branches, rows)
+                # Two objects with known parent IDs give a supervised pair. Count the event weight once per parent.
+                has_pair = (ids >= 0).sum(-1) >= 2
+                relation_sow += (weights[:, None] * has_pair).sum(0)
 
             if balance_origins:
                 # isLepton selects reconstructed electrons and muons. partOrigin supplies their MC label.
@@ -87,7 +122,10 @@ class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
         # sum(w * n_valid) / sum(w) is the weighted mean number of valid objects per event.
         # Every training batch uses this divisor, including when class balancing is disabled.
         self.mean_valid_slots = float(object_sow / event_sow) if object_sow > 0 else 1.0
-
+        if self.relation_loss_weight:
+            # After event-weight normalization, each parent averages over its own labelled events.
+            # A parent with no labelled weight in the entire fold contributes zero.
+            self.relation_factors = torch.where(relation_sow > 0, event_sow / relation_sow, 0.).float()
 
     def forward(self, pred, target, weight, mean_train_weight=None, object_targets=None, object_mask=None, **kwargs):
         """Return the batch loss and the event-class probabilities computed from pred[0].
@@ -135,6 +173,13 @@ class EventAndLeptonObjectLoss(CrossEntropyLossWeighted):
         conv_loss, hf_loss = (lepton_bce.sum(dim=1) / lepton.sum(dim=1, keepdim=True).clamp_min(1)).unbind(dim=1)
         auxiliary = (self.origin_loss_weight * origin_loss + self.conversion_loss_weight * conv_loss
                      + self.heavy_flavour_weight * hf_loss)
+        if self.relation_loss_weight:
+            if pred[1] is None or "shared_parent_logits" not in pred[1]:
+                raise ValueError("Set relation_rank on the model when using relation_loss_weight")
+            ids = _relation_ids(object_targets, valid, self.relation_branches)
+            per_parent = shared_parent_bce(pred[1]["shared_parent_logits"], ids)
+            self.relation_factors = self.relation_factors.to(per_parent.device)
+            auxiliary = auxiliary + self.relation_loss_weight * (per_parent * self.relation_factors).sum(dim=1)
         # Apply the same event weights and normalization as the event loss. The recipe supplies the training-fold mean.
         normalizer = weight.mean() if mean_train_weight is None else mean_train_weight
         return event_loss + (weight * auxiliary).mean() / normalizer, scores

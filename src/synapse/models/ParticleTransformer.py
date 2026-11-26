@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 from functools import partial
 
+from .shared_parent import SharedParentHead
+
 
 @torch.jit.script
 def delta_phi(a, b):
@@ -938,12 +940,16 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                  use_amp=False,
                  num_obj_classes=2,
                  lepton_jet_hf=None,
+                 relation_rank=None,
+                 num_relations=4,
                  **kwargs) -> None:
         super().__init__(input_dim, global_input_dim, **kwargs)
 
-        # The 4+1 heads need stable slot ordering for both jet candidates and MC truth.
+        # Jet candidates and per-object truth IDs need the original slot ordering.
         use_lepton_heads = lepton_jet_hf is not None
-        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference and not use_lepton_heads)
+        self.trimmer = SequenceTrimmer(
+            enabled=trim and not for_inference and not use_lepton_heads and relation_rank is None
+        )
         self.for_inference = for_inference
         self.use_amp = use_amp
 
@@ -1012,6 +1018,7 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         if use_lepton_heads and self.fc is not None and lepton_jet_hf.get("use_event_context", False):
             # With no eligible lepton–jet pair the context is zero. Omitting the bias keeps its contribution zero.
             self.hf_event_projection = nn.Linear(self.hf_head.context_dim, 2 * embed_dim, bias=False)
+        self.parent_head = SharedParentHead(embed_dim, relation_rank, num_relations) if relation_rank is not None else None
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -1070,5 +1077,7 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                     # Add the pooled jet context to the [CLS, global] features before predicting the event class.
                     x_cls = x_cls + self.hf_event_projection(event_jet_context)
             output = self.fc(x_cls)
-            return output, None, obj_output.reshape(-1, self.num_obj_classes)
+            # The relation matrices are auxiliary predictions from the final object tokens.
+            aux = {"shared_parent_logits": self.parent_head(tokens)} if self.parent_head is not None else None
+            return output, aux, obj_output.reshape(-1, self.num_obj_classes)
 

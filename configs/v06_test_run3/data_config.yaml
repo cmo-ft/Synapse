@@ -59,13 +59,14 @@ inputs:
 # 0 = signal (SM ggF or VBF HH), 1 = bkg, 2 = extconv_bkg.
 labels:
   categorical: class_id
-  objects: [partOrigin, isLepton, isConv, isHF]
+  # The model's relation_outputs adds the parent-ID branches to the training labels and test spectators.
+  objects: [partOrigin, isLepton, isConv, isHF, isMET]
 assistants: []
 # Copied to the held-out score tree for comparisons.
 spectators: [eventNumber, dsid, in_extconvcr, n_jet, valid, weight, xgb_score,
              evenet_pS, evenet_pB, evenet_pConv, evenet_valid,
              label_signal, label_bkg, label_extconv_bkg,
-             partOrigin, isLepton, isConv, isHF]
+             partOrigin, isLepton, isConv, isHF, isMET]
 
 # Sum of |weight| for bkg / sum of |weight| for the class, measured on 3fold_2.
 weights:

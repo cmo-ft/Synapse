@@ -351,6 +351,8 @@ class ModelConfig(ConfigBase):
         'metrics': (dict, NoneType),
         'output_names': (list, NoneType),
         'binary_object_output_names': list,
+        'relation_outputs': dict,
+        'relation_output_names': list,  # Older recipes listed only the score names here.
     }
 
     REQUIRED_KEYS = ['model', 'model_params', 'loss_function', 'start_lr']
@@ -376,6 +378,19 @@ class ModelConfig(ConfigBase):
             if self._data['lr_scheduler'] not in ['steps', 'cosine', 'one-cycle']:
                 errors.append(f"Not supported learning rate scheduler: {self._data['lr_scheduler']}. "
                               f"Must be one of ['step', 'cosine', 'linear', 'exponential']")
+
+        relations = self.get("relation_outputs")
+        if relations is not None and not errors:
+            if not all(isinstance(name, str) and name for name in (*relations.keys(), *relations.values())):
+                errors.append("relation_outputs must map truth branch names to score branch names")
+            elif len(set(relations.values())) != len(relations):
+                errors.append("Each relation must have its own score branch name")
+            else:
+                # The head needs only a count. The loss must read truth IDs in that same channel order.
+                self.model_params["num_relations"] = len(relations)
+                loss_params = self.loss_function.get("params") or {}
+                if loss_params.get("relation_loss_weight"):
+                    loss_params["relation_branches"] = list(relations)
 
         return errors
 

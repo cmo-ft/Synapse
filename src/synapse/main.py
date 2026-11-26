@@ -54,12 +54,21 @@ def train(model, model_config, data_config, run_config,
     _logger.info("Set random seed to %d", seed)
     L.seed_everything(seed, workers=True, verbose=False)
 
+    relations = getattr(model_config, "relation_outputs", {})
+    score_names = list(relations.values()) if relations else getattr(model_config, "relation_output_names", None)
+    loss_params = model_config.loss_function.get("params") or {}
+    if loss_params.get("relation_loss_weight") and "relation_branches" not in loss_params:
+        # Earlier four-parent recipes listed the truth branches under data labels.objects.
+        # The original channel order (Higgs, top, W, Z) was alphabetical regardless of dataset column order.
+        branches = sorted(name for name in data_config.labels.get("objects", []) if name.startswith("relation"))
+        loss_params = dict(loss_params, relation_branches=branches)
     model_args = dict(
         run_cfg=run_config, model_class=model_config.model, model_params=model_config.model_params,
-        loss_fn=model_config.loss_function['name'], loss_params=model_config.loss_function['params'],
+        loss_fn=model_config.loss_function['name'], loss_params=loss_params,
         optimizer=model_config.optimizer, start_lr=model_config.start_lr,
         lr_scheduler=model_config.lr_scheduler, metrics=model_config.metrics,
         binary_object_output_names=getattr(model_config, "binary_object_output_names", None),
+        relation_output_names=score_names,
     )
     resume_checkpoint = getattr(run_config, "resume_checkpoint", None)
     if resume_checkpoint and (model_config.load_model or 'train' not in run_config.run_mode):
@@ -77,7 +86,8 @@ def train(model, model_config, data_config, run_config,
         run_cfg=run_config,
         train_file_list=train_file_paths,
         val_file_list=val_file_paths,
-        test_file_list=test_file_paths
+        test_file_list=test_file_paths,
+        relation_branches=tuple(relations),
     )
 
     tb_logger = TensorBoardLogger(save_dir=run_config.run_dir, name=f"TensorBoardLogs_{run_info_str}")
