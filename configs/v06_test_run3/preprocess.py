@@ -1,4 +1,4 @@
-"""Build the three Synapse folds with up to six jets from the v06 SR and ExtConvCR ntuples."""
+"""Build event-only folds from the original v06 ntuples. Object training uses the labelled matrix folds."""
 
 import argparse
 from collections import Counter

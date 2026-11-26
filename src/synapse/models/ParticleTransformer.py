@@ -832,6 +832,74 @@ class ParticleTransformerGlobalFeat(_NormalizedTransformer):
 
 
 
+class LeptonJetHeavyFlavourHead(nn.Module):
+    """Score each of the three leptons using its possible central-jet partners."""
+
+    def __init__(self, embed_dim, jet_tag_indices):
+        super().__init__()
+        self.jet_tag_indices = jet_tag_indices
+        self.lepton_proj = nn.Linear(embed_dim, 24)
+        self.jet_proj = nn.Linear(embed_dim, 24)
+        self.pair_embed = nn.Sequential(
+            nn.Linear(53, 48), nn.LayerNorm(48), nn.GELU(), nn.Linear(48, 48), nn.GELU()
+        )
+        self.pair_rank = nn.Linear(48, 1)
+        self.no_jet = nn.Linear(embed_dim, 1)
+        self.classifier = nn.Sequential(nn.Linear(embed_dim + 48, 32), nn.GELU(), nn.Linear(32, 1))
+
+    def forward(self, tokens, features, vectors, valid):
+        # tokens has shape [B, P, D] for B events, P object slots and D features per token.
+        # The C raw features are [B, C, P], the four-vectors are [B, 4, P], and valid is [B, P].
+        # In the matrix-run layout, slots 0–2 are leptons, 3–8 are central jets (unused slots
+        # are masked), and slot 9 is MET. HF pairing uses only slots 0–8.
+        # Update this head before changing the lepton/jet slot layout or including forward jets
+        # as partners. These slices do not check object types and can silently misassign slots.
+        # TODO: Remove the dependence on slot order. One option is to predict an association matrix
+        # over all object pairs and use reconstructed object types to select eligible lepton–jet pairs.
+        jets = slice(3, min(9, tokens.size(1) - 1))
+        # With J central-jet slots, these slices give [B, 3, D] and [B, J, D], including padded slots.
+        leptons, jet_tokens = tokens[:, :3], tokens[:, jets]
+
+        vectors = vectors.float() * 0.001  # MeV to GeV
+        # The None axes pair every lepton with every central jet. Adding [B, 4, 3, 1] and
+        # [B, 4, 1, J] gives [B, 4, 3, J]. Taking the invariant mass leaves [B, 3, J].
+        pair_mass = to_m2(vectors[:, :, :3, None] + vectors[:, :, None, jets], eps=0).squeeze(1).sqrt()
+        pt = torch.linalg.vector_norm(vectors[:, :2], dim=1)
+        pt_ratio = pt[:, :3, None] / pt[:, None, jets].clamp_min(1.e-4)
+        eta, phi = features[:, 1], features[:, 2]
+        dr = delta_r2(eta[:, :3, None], phi[:, :3, None], eta[:, None, jets], phi[:, None, jets]).sqrt()
+        if self.jet_tag_indices is None:
+            tag = available = torch.zeros_like(dr)
+        else:
+            quantile, known = self.jet_tag_indices
+            tag = features[:, quantile, None, jets].expand_as(dr)
+            available = features[:, known, None, jets].expand_as(dr)
+        # Stack five numbers per pair to get [B, 3, J, 5]. Each jet's tag is shared across the lepton rows.
+        kinematics = torch.stack((dr, pair_mass.log1p(), pt_ratio.clamp_max(50).log1p(), tag, available), dim=-1)
+
+        # Expand [B, 3, 1, 24] and [B, 1, J, 24] to the same [B, 3, J, 24] pair grid.
+        lepton_embed = self.lepton_proj(leptons).unsqueeze(2).expand(-1, -1, jet_tokens.size(1), -1)
+        jet_embed = self.jet_proj(jet_tokens).unsqueeze(1).expand(-1, leptons.size(1), -1, -1)
+        # Concatenate 24 lepton + 24 jet + 5 kinematic/tag features, then embed each pair in 48 dimensions.
+        pairs = self.pair_embed(torch.cat((lepton_embed, jet_embed, kinematics), dim=-1))
+
+        # ranks is [B, 3, J]. Append one learned "no jet" score per lepton. Each row of
+        # probs then sums to one over J + 1 choices, with zero probability for padded jets.
+        ranks = self.pair_rank(pairs).squeeze(-1).masked_fill(~valid[:, None, jets], -torch.inf)
+        probs = torch.cat((ranks, self.no_jet(leptons)), dim=-1).softmax(dim=-1)
+        # Use the J jet columns to weight the pair embeddings. Summing over jets gives [B, 3, 48].
+        # An event with no valid central jet has zero jet context for each lepton.
+        context = (probs[:, :, :-1, None] * pairs).sum(dim=2)
+        # The classifier maps [B, 3, D + 48] to one HF logit per lepton [B, 3, 1].
+        hf = self.classifier(torch.cat((leptons, context), dim=-1))
+
+        # A logit of -20 gives a near-zero sigmoid probability for missing leptons and nonlepton slots.
+        hf = hf.masked_fill(~valid[:, :3, None], -20.)
+        # pad reads axes from the end. (0, 0) keeps the single logit column.
+        # (0, P - 3) appends rows after the three leptons, giving [B, P, 1] aligned with the input slots.
+        return nn.functional.pad(hf, (0, 0, 0, tokens.size(1) - leptons.size(1)), value=-20.)
+
+
 class ParticleTransformerSimple(_NormalizedTransformer):
 
     def __init__(self,
@@ -857,10 +925,14 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                  trim=True,
                  for_inference=False,
                  use_amp=False,
+                 num_obj_classes=2,
+                 lepton_jet_hf=None,
                  **kwargs) -> None:
         super().__init__(input_dim, global_input_dim, **kwargs)
 
-        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+        # The 4+1 heads need stable slot ordering for both jet candidates and MC truth.
+        use_lepton_heads = lepton_jet_hf is not None
+        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference and not use_lepton_heads)
         self.for_inference = for_inference
         self.use_amp = use_amp
 
@@ -902,15 +974,22 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         else:
             self.fc = None
 
-        # fc for object classification 
-        # self.num_obj_classes = 4 # hardcoded for now:  0 for others, 1 for higgs, 2 for top, 3 for z, w, diboson
-        self.num_obj_classes = 2 # hardcoded for now:  0 for others, 1 for heavy flavours
+        self.num_obj_classes = num_obj_classes
+        self.hf_head = None
+        if use_lepton_heads:
+            if num_obj_classes != 5 or input_dim < 3:
+                raise ValueError("lepton_jet_hf requires five object logits and eta/phi in feature columns 1 and 2")
+            tag_indices = lepton_jet_hf.get("jet_tag_indices")
+            if tag_indices is not None and (len(tag_indices) != 2 or len(set(tag_indices)) != 2 or
+                                            any(i < 0 or i >= input_dim for i in tag_indices)):
+                raise ValueError("jet_tag_indices must give the tag quantile and availability feature columns")
+            self.hf_head = LeptonJetHeavyFlavourHead(embed_dim, tag_indices)
         self.obj_fc = nn.Sequential(
             nn.Linear(embed_dim, embed_dim//2),
             nn.ReLU(),
             nn.Linear(embed_dim//2, embed_dim//4),
             nn.ReLU(),
-            nn.Linear(embed_dim//4, self.num_obj_classes)
+            nn.Linear(embed_dim//4, 4 if use_lepton_heads else self.num_obj_classes)
         )
 
         # init
@@ -929,7 +1008,7 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         # for pytorch: uu (N, C', num_pairs), uu_idx (N, 2, num_pairs)
         # for onnx: uu (N, C', P, P), uu_idx=None
 
-        # normalize input features
+        raw_features = x
         x, g = self.normalize_inputs(x, g)
 
         with torch.no_grad():
@@ -964,9 +1043,12 @@ class ParticleTransformerSimple(_NormalizedTransformer):
             if self.fc is None:
                 return x_cls
             output = self.fc(x_cls)
-            # object output: classification for each particle
-            obj_output = self.obj_fc(x.permute(1,0,2).contiguous().view(-1, x.size(2))) # (N*P, num_obj_classes)
-            output_for_aux = None
-
-            return output, output_for_aux, obj_output
+            tokens = x.transpose(0, 1)
+            obj_output = self.obj_fc(tokens)
+            if self.hf_head is not None:
+                if v is None:
+                    raise ValueError("The lepton–jet heavy-flavour head requires object four-vectors")
+                hf = self.hf_head(tokens, raw_features, v, mask.squeeze(1))
+                obj_output = torch.cat((obj_output, hf), dim=-1)
+            return output, None, obj_output.reshape(-1, self.num_obj_classes)
 

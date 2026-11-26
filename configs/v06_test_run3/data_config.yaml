@@ -1,7 +1,8 @@
 # Synapse fold_0, physically split by eventNumber % 3 during preprocessing.
-train_files: [3fold_2.root]
-val_files: [3fold_1.root]
-test_files: [3fold_0.root]
+# Paths are relative to the Synapse checkout root.
+train_files: [../run/v06_test_run3_matrix_prediction/dataset/3fold_2.root]
+val_files: [../run/v06_test_run3_matrix_prediction/dataset/3fold_1.root]
+test_files: [../run/v06_test_run3_matrix_prediction/dataset/3fold_0.root]
 tree_name: tree
 
 new_variables:
@@ -11,10 +12,11 @@ new_variables:
   py: "pt * np.sin(phi)"
   pz: "pt * np.sinh(eta)"
   abs_weight: "np.abs(weight)"
+  isLepton: "valid & ((np.abs(pdg) == 11) | (np.abs(pdg) == 13))"
 
 inputs:
-  # Object slots are l1, l2, l3, up to six leading central jets, then MET.
-  obj_feats: [log1p_pt, eta, phi, log1p_e, pdg, charge, isMET, isJet]
+  # Labelled matrix folds contain three leptons, six central jets, MET and two forward slots.
+  obj_feats: [log1p_pt, eta, phi, log1p_e, pdg, charge, isMET, isJet, tagQuantile, tagAvailable]
   evt_feats:
     - hhml_subChannelFlavor
     - n_jet
@@ -57,11 +59,13 @@ inputs:
 # 0 = signal (SM ggF or VBF HH), 1 = bkg, 2 = extconv_bkg.
 labels:
   categorical: class_id
+  objects: [partOrigin, isLepton, isConv, isHF]
 assistants: []
 # Copied to the held-out score tree for comparisons.
-spectators: [eventNumber, dsid, in_extconvcr, n_jet, weight, xgb_score,
+spectators: [eventNumber, dsid, in_extconvcr, n_jet, valid, weight, xgb_score,
              evenet_pS, evenet_pB, evenet_pConv, evenet_valid,
-             label_signal, label_bkg, label_extconv_bkg]
+             label_signal, label_bkg, label_extconv_bkg,
+             partOrigin, isLepton, isConv, isHF]
 
 # Sum of |weight| for bkg / sum of |weight| for the class, measured on 3fold_2.
 weights:

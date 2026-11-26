@@ -59,6 +59,7 @@ def train(model, model_config, data_config, run_config,
         loss_fn=model_config.loss_function['name'], loss_params=model_config.loss_function['params'],
         optimizer=model_config.optimizer, start_lr=model_config.start_lr,
         lr_scheduler=model_config.lr_scheduler, metrics=model_config.metrics,
+        binary_object_output_names=getattr(model_config, "binary_object_output_names", None),
     )
     resume_checkpoint = getattr(run_config, "resume_checkpoint", None)
     if resume_checkpoint and (model_config.load_model or 'train' not in run_config.run_mode):

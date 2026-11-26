@@ -29,6 +29,7 @@ class ModelModule(L.LightningModule):
             lr_scheduler: str | None = None,
             metrics: Dict[str, dict] | None = None,
             mean_train_weight: float | None = None,
+            binary_object_output_names: list[str] | None = None,
     ) :
         """
         Initialize LightningModule wrapper.
@@ -47,9 +48,14 @@ class ModelModule(L.LightningModule):
             lr_scheduler (str): Learning rate scheduler to be used.
             metrics (dict): Dictionary of metric names and their corresponding functions.
             mean_train_weight (float): Training-fold loss normalization restored from a checkpoint.
+            binary_object_output_names (list): Ordered ROOT branch names for the per-object probabilities.
         """
         super().__init__()
         self.run_cfg = run_cfg
+        if binary_object_output_names is None:
+            # Older saved recipes kept these names in the run configuration.
+            binary_object_output_names = run_cfg.get("binary_object_output_names", [])
+        self.binary_object_output_names = binary_object_output_names
 
         model_cls = dynamic_import(model_class)
 
@@ -153,6 +159,13 @@ class ModelModule(L.LightningModule):
             self.hparams.mean_train_weight = self.trainer.datamodule.train_dataset.mean_weight
             _logger.info("Mean balanced training event weight: %.10g", self.hparams.mean_train_weight)
 
+    def on_train_start(self) -> None:
+        # Fit after checkpoint restoration so a resumed run uses this fold's object weights.
+        if hasattr(self.loss_fn, "prepare_training_fold"):
+            dataset = self.trainer.datamodule.train_dataset
+            data = dataset.data
+            self.loss_fn.prepare_training_fold(data, data["mask"], data[dataset.data_cfg.weight_key])
+
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """
         Universal forward method to call the model.
@@ -177,7 +190,7 @@ class ModelModule(L.LightningModule):
 
 
         inputs = [x[k] for k in x.keys()]
-        labels = [y[k] for k in y.keys()]
+        labels = [value for name, value in y.items() if name != 'objects']
         weight = [w[k] for k in w.keys()][0]
 
         logits = self(*inputs)
@@ -185,6 +198,8 @@ class ModelModule(L.LightningModule):
                            extra_obj_info=(extra_obj_info, object_label, object_mask))
         if self._use_fold_mean:
             loss_kwargs["mean_train_weight"] = self.hparams.mean_train_weight
+        if 'objects' in y:
+            loss_kwargs.update(object_targets=y['objects'], object_mask=object_mask)
         loss, scores = self.loss_fn(logits, *labels, **loss_kwargs)
 
         logits, logits_aux, obj_logits = logits
@@ -210,11 +225,19 @@ class ModelModule(L.LightningModule):
             )
 
         if stage == "test":
+            columns = {k: value.numpy(force=True) for k, value in s.items()}
+            names = self.binary_object_output_names
+            if names:
+                batch_size, _, slots = object_mask.shape
+                if obj_logits.shape != (batch_size * slots, len(names)):
+                    raise ValueError("Object logits must match the configured names and original object slots")
+                probs = obj_logits.reshape(batch_size, slots, len(names)).sigmoid().numpy(force=True)
+                columns.update({name: probs[:, :, i] for i, name in enumerate(names)})
             return {
                 "loss": loss,
                 "scores": scores.numpy(force=True),
                 "weight": weight.numpy(force=True),
-                "spectators": {k: s[k].numpy(force=True) for k in s.keys()}
+                "spectators": columns
             }
 
         return loss

@@ -44,6 +44,14 @@ def prepare_data(data: ak.Array, data_cfg: DataConfig, dataset_type: str) -> dic
             prepared_data[k] = ak.to_numpy(data[k])
     if data_cfg.weight_key in data.fields:
         prepared_data[data_cfg.weight_key] = ak.to_numpy(data[data_cfg.weight_key]).astype(np.float32)
+    if dataset_type == 'train':
+        for name in data_cfg.labels.get('objects', []):
+            if name not in data.fields:
+                raise ValueError(f"Training fold is missing the per-object truth branch {name!r}")
+            values = ak.to_numpy(data[name])
+            if values.shape != prepared_data['mask'][:, 0].shape:
+                raise ValueError(f"Truth branch {name!r} must have one value per object slot")
+            prepared_data[name] = values
     if dataset_type == 'test':
         for k in data_cfg.spectators:
             prepared_data[k] = ak.to_numpy(data[k])
@@ -69,7 +77,8 @@ class MapStyleDataset(Dataset):
         self.data_cfg = data_cfg
         if dataset_type not in ['train', 'val', 'test']:
             raise ValueError(f"Invalid dataset type: {dataset_type}. Must be one of ['train', 'val', 'test'].")
-        keys = data_cfg.active_keys
+        self.object_label_keys = data_cfg.labels.get('objects', []) if dataset_type == 'train' else []
+        keys = [*data_cfg.active_keys, *self.object_label_keys]
         if dataset_type == 'test':
             keys.extend(data_cfg.spectators)
         if data_cfg.new_variables:
@@ -134,6 +143,8 @@ class MapStyleDataset(Dataset):
         # TODO: copy.deepcopy() is not efficient, consider using a more efficient method if needed
         x = {k: copy.deepcopy(self.data[k][idx]) for k in self.data_cfg.inputs.keys()}
         y = {k: copy.deepcopy(self.data[k][idx]) for k in self.data_cfg.final_label_keys}
+        if self.object_label_keys:
+            y['objects'] = {name: self.data[name][idx] for name in self.object_label_keys}
         w = {self.data_cfg.weight_key:  copy.deepcopy(self.data[self.data_cfg.weight_key][idx])}
         s = {}
         if self.dataset_type == 'test':

@@ -241,7 +241,8 @@ class DataConfig(ConfigBase):
 
         data = object.__getattribute__(self, '_data')
         # construct internal items
-        data['label_keys'] = flatten_nested_list(list(data['labels'].values()))
+        # Per-object truth is loaded only for training, separately from the event targets.
+        data['label_keys'] = flatten_nested_list([v for k, v in data['labels'].items() if k != 'objects'])
         data['active_keys'] = flatten_nested_list([
             *data['inputs'].values(),
             *data['label_keys'],
@@ -349,6 +350,7 @@ class ModelConfig(ConfigBase):
         'optimizer': str,
         'metrics': (dict, NoneType),
         'output_names': (list, NoneType),
+        'binary_object_output_names': list,
     }
 
     REQUIRED_KEYS = ['model', 'model_params', 'loss_function', 'start_lr']
@@ -405,6 +407,7 @@ class RunConfig(ConfigBase):
         'use_amp': bool,
         'checkpoint_dir': (str, NoneType),
         'test_output': (str, NoneType),
+        'binary_object_output_names': list,  # For older saved run configurations.
         'onnx_path': (str, NoneType),
         'export_onnx': (str, NoneType),
     }
