@@ -16,7 +16,8 @@ new_variables:
 
 inputs:
   # Labelled matrix folds contain three leptons, six central jets, MET and two forward slots.
-  obj_feats: [log1p_pt, eta, phi, log1p_e, pdg, charge, isMET, isJet, tagQuantile, tagAvailable]
+  obj_feats: [log1p_pt, eta, phi, log1p_e, pdg, charge, isMET, isJet, tagQuantile, tagAvailable,
+              caloIsoRel, trackIsoRel, isForward]
   evt_feats:
     - hhml_subChannelFlavor
     - n_jet
@@ -53,6 +54,7 @@ inputs:
     - dR_l2j2
     - dR_l3j2
     - dR_j1j2
+    - n_forward_jet
   obj_4vecs: [px, py, pz, e]
   mask: [valid]
 
