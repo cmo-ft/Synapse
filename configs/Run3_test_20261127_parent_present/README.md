@@ -15,10 +15,13 @@ The `prepare_dataset.py` audit verifies all six published ROOT files against the
 
 ## Recipe lineage
 
-The paths below are relative to `configs/`.
+The paths below are relative to `configs/`. For the commands to rebuild all six labelled folds from the selected CAF ntuples and the indexed EasyJet files, see `preprocessing.md` in this directory.
 
 | Directory | Contents |
 |---|---|
+| `Run3_test_20261123/` | Initial SR and ExtConvCR MC folds, object truth and original 35-event-feature schema. |
+| `Run3_test_20261124_physics/` | Reconstructed jet inputs, control-region sampling, EasyJet matching and six-file merge. |
+| `Run3_test_20261125_relations/` | Parent identities, the WZ control-region assignment audit and publication of the impact-parameter-free folds. |
 | `Run3_test_20261126_ancestry/` | Ancestry targets, WZ supervision, training launcher, evaluation and control-region checks. |
 | `Run3_test_20261127_higgs_tree/` | Explicit Higgs daughters and grandchildren, ambiguous matches, and packed pair labels. |
 | `Run3_test_20261127_higgs_lepton_fallback/` | EasyJet lepton fallback, consistency checks, documented truth-label limitations, migration diagnostics and comparisons. Start with `truth_labels.md`. |
@@ -55,7 +58,7 @@ python "$run/frozen/recipe/launch.py" validation --fold 1 --run "$run" --checkpo
 python "$run/frozen/recipe/launch.py" test --fold 1 --run "$run" --checkpoint "$checkpoint"
 ```
 
-`stage_run.py --reference /path/to/previous/run` selects and verifies sources from an archived predecessor. Without that option the staging code reads the branch and writes a SHA-256 manifest. These training commands require the labelled MC folds. Rebuilding those folds uses the preceding published label files, Higgs-record shards and the 3l0tau CAF production plan at the paths in `prepare_dataset.py`. PyROOT matching also needs the CAF `source/include/physics.hxx` corresponding to that plan. The production CPU and HTCondor scripts keep their original CERN paths.
+`stage_run.py --reference /path/to/previous/run` selects and verifies sources from an archived predecessor. Without that option the staging code reads the branch and writes a SHA-256 manifest. These training commands require the labelled MC folds. The preprocessing recipes include the original CAF reconstruction header in `configs/run3_common/physics.hxx`. The external inputs are the selected MC ntuples, the matching CAF plan and the EasyJet files indexed by that plan.
 
 ## Read the transfer package
 

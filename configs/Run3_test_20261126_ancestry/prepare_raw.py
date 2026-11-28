@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 import numpy as np
-from paths import PLAN, PRODUCTION, RECIPE, REFERENCE, REPO, RUN
+from paths import PLAN, RECIPE, REFERENCE, REPO, RUN
 
 
 def jobs_for(plan):
@@ -22,7 +22,7 @@ def read_truth(job, sample, numbers):
     import ROOT
     ROOT.gROOT.SetBatch(True)
     if not hasattr(ROOT, "ancestry") or not hasattr(ROOT.ancestry, "labels"):
-        for folder in (PRODUCTION / "source/include", REPO / "configs/run3_common", RECIPE):
+        for folder in (REPO / "configs/run3_common", RECIPE):
             ROOT.gInterpreter.AddIncludePath(str(folder))
         if not ROOT.gInterpreter.Declare('#include "ancestry.hxx"'):
             raise RuntimeError("Failed to compile ancestry matcher")

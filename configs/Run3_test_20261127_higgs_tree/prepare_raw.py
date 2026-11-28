@@ -6,7 +6,7 @@ from tempfile import NamedTemporaryFile
 
 import numpy as np
 import uproot
-from paths import PHYSICS, PLAN, PRODUCTION, RECIPE, REPO, RUN
+from paths import PHYSICS, PLAN, RECIPE, REPO, RUN
 
 VERSION = 1
 FIELDS = {"ids": "i1", "ancestry": "i1", "known": "i2", "same": "i2"}
@@ -25,7 +25,7 @@ def identity(numbers, pt):
 def read_labels(job, numbers):
     import ROOT
     if not hasattr(ROOT, "higgsdecay"):
-        for directory in (PRODUCTION/"source/include", REPO/"configs/run3_common", RECIPE):
+        for directory in (REPO/"configs/run3_common", RECIPE):
             ROOT.gInterpreter.AddIncludePath(str(directory))
         if not ROOT.gInterpreter.Declare('#include "higgs_decay.hxx"'):
             raise RuntimeError("Cannot compile the Higgs daughter matcher")

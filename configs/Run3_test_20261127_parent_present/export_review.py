@@ -88,6 +88,9 @@ def export_sources(run, dest):
     branch = git(REPO, "symbolic-ref", "--short", "HEAD").decode().strip()
     base = git(REPO, "rev-parse", BASELINE).decode().strip()
     git(REPO, "bundle", "create", dest / "Synapse.bundle", f"refs/heads/{branch}", "HEAD")
+    (dest / "preprocessing.md").write_bytes(
+        git(REPO, "show", f"{commit}:configs/Run3_test_20261127_parent_present/preprocessing.md")
+    )
     (dest / "changes.patch").write_bytes(git(REPO, "diff", "--no-ext-diff", "--binary", base, commit))
     evaluator = git(REPO, "rev-parse", commit + ":hhml_eval").decode().strip()
     transform = git(REPO / "TransformTool", "rev-parse", "HEAD").decode().strip()
@@ -191,6 +194,7 @@ def review_text(source, best, results):
         "```",
         "",
         "Read `Synapse/configs/Run3_test_20261127_parent_present/README.md` for changes in the model, labels and training. "
+        "The commands to rebuild the six MC folds are in `source/preprocessing.md`. "
         "The detailed truth definition and open questions are in "
         "`Synapse/configs/Run3_test_20261127_higgs_lepton_fallback/truth_labels.md`. "
         "`source/frozen/` contains the exact training snapshot. Its `sha256.json` documents the historical file bytes. "
