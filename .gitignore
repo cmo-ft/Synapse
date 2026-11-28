@@ -99,3 +99,9 @@ ENV/
 env.bak/
 venv.bak/
 setup.sh
+
+# Local data, training products and standalone checkouts
+/run_dir/
+/review_exports/
+/shudongenv/
+/TransformTool/

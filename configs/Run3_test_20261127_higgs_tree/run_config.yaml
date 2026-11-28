@@ -1,0 +1,15 @@
+run_dir: output/fold_0
+run_mode: [train]
+cross_validation: false
+device: gpu
+n_devices: 1
+epochs: 50
+batch_size: 768
+num_workers: 0
+seed: 42
+use_amp: false
+val_sanity_check: false
+logger_config: {enable_stdout: true, log_file: synapse.log}
+checkpoint_dir: checkpoints
+physics_epoch_log: true
+stream_scores: true

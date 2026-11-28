@@ -1,0 +1,78 @@
+# Three event classes, five origin/conversion/HF predictions, four ancestry scores and four shared-parent matrices.
+model: synapse.models.ParticleTransformer.ParticleTransformerSimple
+model_params:
+  input_dim: 14
+  standardization_clip: 12.0
+  global_input_batchnorm: false
+  ancestry_outputs: [p_ancestry_higgs, p_ancestry_top, p_ancestry_w, p_ancestry_z]
+  wz_recoil: true
+  global_input_dim: 36
+  num_classes: 3
+  num_obj_classes: 5
+  lepton_jet_hf:
+    jet_tag_indices: [8, 9]  # tagQuantile, tagAvailable
+    use_event_context: true  # Feed the HF-weighted jet context into the event classifier.
+  shared_parent_rank: 16  # Components per object and parent in the shared-parent head.
+  shared_parent_feedback: true
+  pair_input_dim: 4
+  use_pre_activation_pair: false
+  embed_dims: [32, 128, 128]
+  global_embed_dims: [32, 128, 128]
+  pair_embed_dims: [64, 64, 64]
+  num_heads: 4
+  num_layers: 5  # Blocks 1–4 predict the matrices. Block 5 uses them in attention.
+  num_cls_layers: 1
+  fc_params: [[128, 0], [64, 0], [32, 0]]
+  trim: false
+
+output_names: [p_signal, p_bkg, p_extconv_bkg]
+binary_object_output_names: [p_lepton_higgs, p_lepton_top, p_lepton_wzvv, p_lepton_conversion, p_lepton_hf]
+# Exclude a pair if either object has any listed flag. Use [] to include every valid object.
+shared_parent_veto_features: [isMET]
+# Each entry pairs a training truth branch with its output score. The order defines the matrix channels.
+shared_parent_outputs:
+  relationHiggs: p_pair_higgs
+  relationTop: p_pair_top
+  relationW: p_pair_w
+  relationZ: p_pair_z
+loss_function:
+  name: synapse.loss_functions.ancestry.AncestryControlLoss
+  params:
+    mean_train_weight: auto
+    ancestry_branches: [ancestryHiggs, ancestryTop, ancestryW, ancestryZ]
+    ancestry_loss_weight: 0.02
+    control_z_weight: 0.10
+    recoil_weight: 0.10
+    origin_loss_weight: 0.10
+    conversion_loss_weight: 0.10
+    heavy_flavour_weight: 0.08
+    shared_parent_loss_weight: 0.02  # Per parent, matching 0.10 / 5 in the matrix run.
+    balance_origin_classes: true
+optimizer: AdamW
+start_lr: 0.0008
+lr_scheduler: cosine
+metrics:
+  Accuracy:
+    function: synapse.core.metrics.weighted_accuracy
+    stages: [val, test]
+    on_epoch: true
+  AUC:
+    function: synapse.core.metrics.weighted_auc
+    stages: [val, test]
+    on_epoch: true
+  CM:
+    function: synapse.core.metrics.weighted_confusion_matrix
+    stages: [val, test]
+    on_epoch: true
+  Rejection20:
+    function: synapse.core.metrics.hh_rejection_at_20
+    stages: [val, test]
+    on_epoch: true
+    uses_selection_info: true
+  Significance20_30_50:
+    function: synapse.core.working_point_significance.hh_significance_20_30_50
+    stages: [val, test]
+    on_epoch: true
+    uses_selection_info: true
+    is_monitor: true
+    mode: max

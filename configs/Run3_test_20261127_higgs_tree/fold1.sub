@@ -1,0 +1,20 @@
+universe = vanilla
+batch_name = Run3_test_20261127_higgs_tree_fold1
+executable = /bin/bash
+arguments = /eos/home-c/cmo/project/HHML/FullRun2Run3/mva/Synapse/run_dir/Run3_test_20261127_higgs_tree/worker.sh 1
+spool_dir = /afs/cern.ch/user/c/cmo/private/workspace/hhml/submit-synapse
+initialdir = $(spool_dir)
+log = $(spool_dir)/Run3_test_20261127_higgs_tree_$(ClusterId).log
+output = $(spool_dir)/Run3_test_20261127_higgs_tree_$(ClusterId).out
+error = $(spool_dir)/Run3_test_20261127_higgs_tree_$(ClusterId).err
+should_transfer_files = YES
+transfer_executable = False
+transfer_output_files = ""
+when_to_transfer_output = ON_EXIT
+MY.SendCredential = True
+request_cpus = 8
+request_memory = 26000M
+request_gpus = 1
+request_disk = 5000M
++JobFlavour = "testmatch"
+queue 1
