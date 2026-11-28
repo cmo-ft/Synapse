@@ -145,6 +145,7 @@ class ModelModule(L.LightningModule):
                 # TODO: validate that metrics has 'is_monitor' must has 'mode' and its stages contains 'val'
                 self.metrics[metric_name]['is_monitor'] = metric_fn_dict.get('is_monitor', False)
                 self.metrics[metric_name]['mode'] = metric_fn_dict.get('mode')
+                self.metrics[metric_name]['uses_selection_info'] = metric_fn_dict.get('uses_selection_info', False)
 
         # TODO: move this validation to model_config validation
         # validate is_monitor flag is unique
@@ -200,13 +201,23 @@ class ModelModule(L.LightningModule):
             x.pop('extra_obj_info')
 
 
+        physics_info = x.pop("physics_info", None)
+        selection_info = x.pop("selection_info", None)
+        if physics_info is not None:
+            selection_info = physics_info[:, 2:4]  # n_jet, signed nominal MC weight
         inputs = [x[k] for k in x.keys()]
         labels = [value for name, value in y.items() if name != 'objects']
         weight = [w[k] for k in w.keys()][0]
 
-        logits = self(*inputs)
+        if stage == "train" and physics_info is not None and getattr(self.model, "wz_recoil", None) is not None:
+            from ..models.wz_recoil import forward_with_control
+            logits = forward_with_control(self.model, inputs, physics_info[:, 0].bool())
+        else:
+            logits = self(*inputs)
         loss_kwargs = dict(weight=weight, extra_event_info=extra_event_info,
                            extra_obj_info=(extra_obj_info, object_label, object_mask))
+        if physics_info is not None:
+            loss_kwargs["physics_info"] = physics_info
         if self._use_fold_mean:
             loss_kwargs["mean_train_weight"] = self.hparams.mean_train_weight
         if 'objects' in y:
@@ -222,7 +233,8 @@ class ModelModule(L.LightningModule):
                  batch_size=weight.shape[0])
         for metric_name, metric_fn_dict in self.metrics.items():
             if stage in metric_fn_dict["stages"] and metric_fn_dict["on_step"]:
-                metric = metric_fn_dict['fn'](logits, *labels, weight = weight)
+                extra = {"selection_info": selection_info} if metric_fn_dict['uses_selection_info'] else {}
+                metric = metric_fn_dict['fn'](logits, *labels, weight=weight, **extra)
                 if is_scalar(metric):
                     self.log(f"{stage}_{metric_name}_step", metric, on_step=True, prog_bar=True, logger=True)
 
@@ -232,6 +244,7 @@ class ModelModule(L.LightningModule):
                     "logits": logits.detach().cpu(),
                     "labels": [label.detach().cpu() for label in labels],
                     "weight": weight.detach().cpu(),
+                    "selection_info": selection_info.detach().cpu() if selection_info is not None else None,
                 }
             )
 
@@ -248,6 +261,13 @@ class ModelModule(L.LightningModule):
                 probabilities = matrices[:, :, i, j].sigmoid().masked_fill(~valid_pairs[:, None, :], -1.)
                 for name, values in zip(self.shared_parent_output_names, probabilities.unbind(1), strict=True):
                     columns[name] = values.numpy(force=True)
+            if logits_aux and "ancestry_logits" in logits_aux:
+                eligible = shared_parent_object_mask(object_mask[:, 0], (s[name] for name in self.shared_parent_veto_features))
+                probs = logits_aux["ancestry_logits"].sigmoid().masked_fill(~eligible.unsqueeze(-1), -1.)
+                for name, values in zip(self.model.ancestry_outputs, probs.unbind(-1), strict=True):
+                    columns[name] = values.numpy(force=True)
+            if logits_aux and "wz_recoil" in logits_aux:
+                columns["p_recoil_wz"] = logits_aux["wz_recoil"].sigmoid().numpy(force=True)
             names = self.binary_object_output_names
             if names:
                 batch_size, _, max_objects = object_mask.shape
@@ -320,10 +340,16 @@ class ModelModule(L.LightningModule):
         for i in range(len(outputs[0]["labels"])):
             all_labels.append(torch.cat([o["labels"][i] for o in outputs]))
         all_weights = torch.cat([o["weight"] for o in outputs])
+        selection_info = None
+        if outputs[0].get("selection_info") is not None:
+            selection_info = torch.cat([o["selection_info"] for o in outputs])
 
         for metric_name, metric_fn_dict in self.metrics.items():
             if stage in metric_fn_dict["stages"] and metric_fn_dict["on_epoch"]:
-                metric = metric_fn_dict['fn'](all_logits, *all_labels, weight=all_weights)
+                extra = {"selection_info": selection_info} if metric_fn_dict['uses_selection_info'] else {}
+                if extra and selection_info is None:
+                    raise ValueError(f"{metric_name} requires n_jet and signed nominal weight")
+                metric = metric_fn_dict['fn'](all_logits, *all_labels, weight=all_weights, **extra)
                 _logger.info(f"{stage}_{metric_name}_epoch: \n{metric}")
                 if is_scalar(metric):
                     self.log(f"{stage}_{metric_name}_epoch", metric, on_step=False, on_epoch=True, prog_bar=True, logger=True)

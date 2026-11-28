@@ -10,7 +10,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 from synapse.core.config import ConfigManager
 from synapse.core.logger import EnhancedLogger
-from synapse.core.callbacks import SaveTestOutputs, SaveONNX
+from synapse.core.callbacks import SaveTestOutputs, SaveONNX, PhysicsEpochLog
 from synapse.core.model_module import ModelModule
 from synapse.core.data_module import DataModule
 from synapse.models.shared_parent import DEFAULT_SHARED_PARENT_VETO
@@ -103,6 +103,8 @@ def train(model, model_config, data_config, run_config,
     tb_logger = TensorBoardLogger(save_dir=run_config.run_dir, name=f"TensorBoardLogs_{run_info_str}")
 
     trainer_callbacks = [ModelSummary(max_depth=1)]
+    if 'train' in run_config.run_mode and getattr(run_config, "physics_epoch_log", False):
+        trainer_callbacks.append(PhysicsEpochLog(os.path.join(run_config.run_dir, "epochs")))
     best_checkpoint_callback = None
     if run_config.checkpoint_dir:
         checkpoint_dir = update_file_path(run_config.run_dir, run_config.checkpoint_dir, run_info_str, path_suffix)
@@ -164,7 +166,7 @@ def train(model, model_config, data_config, run_config,
         max_epochs=run_config.epochs,
         logger=tb_logger,
         precision= '16-mixed' if run_config.use_amp else '32-true',
-        enable_progress_bar=True,
+        enable_progress_bar=not getattr(run_config, "physics_epoch_log", False),
         enable_model_summary=False,
         inference_mode=True,
         callbacks= trainer_callbacks,

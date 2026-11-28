@@ -1,4 +1,9 @@
+import json
 import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import uproot
 
 import awkward as ak
 import lightning as L
@@ -21,6 +26,8 @@ class SaveTestOutputs(L.Callback):
         self.model_cfg = model_cfg
         self.run_cfg = run_cfg
         self.output_filepath = output_filepath
+        self.stream_scores = getattr(run_cfg, "stream_scores", False)
+        self.stream_file = self.stream_tree = None
         if not self.output_filepath.endswith(".root"):
             raise ValueError("Output filepath doesn't end with .root extension.")
 
@@ -38,10 +45,23 @@ class SaveTestOutputs(L.Callback):
             }
         )
 
+        if self.stream_scores and len(self.test_outputs) >= 16:
+            self._flush()
+
     def on_test_end(self, trainer, pl_module):
-        """
-        Save the collected test outputs to a root file.
-        """
+        if self.test_outputs:
+            self._flush()
+        if self.stream_file is not None:
+            self.stream_file.close()
+            Path(self.output_filepath + ".partial").replace(self.output_filepath)
+            self.stream_file = self.stream_tree = None
+
+    def on_exception(self, trainer, pl_module, exception):
+        if self.stream_file is not None:
+            self.stream_file.close()
+            self.stream_file = self.stream_tree = None
+
+    def _flush(self):
         if not self.test_outputs:
             _logger.warning("No test outputs collected.")
             return
@@ -53,6 +73,7 @@ class SaveTestOutputs(L.Callback):
 
         _logger.info(f"Saving test outputs: {len(self.test_outputs)} batches collected.")
         self.save_to_root(all_scores, all_labels, all_weights, all_spectators)
+        self.test_outputs.clear()
 
     def save_to_root(self, scores, labels, weights, spectators):
         """
@@ -91,9 +112,49 @@ class SaveTestOutputs(L.Callback):
         else:
             output["_weights"] = weights
         output.update(spectators)
+        if self.stream_scores:
+            if self.stream_file is None:
+                self.stream_file = uproot.recreate(self.output_filepath + ".partial",compression=uproot.LZ4(4))
+                schema = {k: np.dtype((v.dtype, v.shape[1:])) for k,v in output.items()}
+                self.stream_tree = self.stream_file.mktree("tree", schema)
+            self.stream_tree.extend(output)
+            return
         write_file(self.output_filepath, ak.Array(output))
 
         _logger.info(f"Test outputs saved to {self.output_filepath}.")
+
+class PhysicsEpochLog(L.Callback):
+    """Publish one atomic record for each completed validation epoch."""
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.started = time.monotonic()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if batch_idx % 512 == 0:
+            progress = dict(epoch=trainer.current_epoch+1, completed_batches=batch_idx+1,
+                            batches=trainer.num_training_batches, steps=trainer.global_step,
+                            loss=float(outputs["loss"].detach()), time=datetime.now(timezone.utc).isoformat())
+            temp = self.directory / "progress.tmp"
+            temp.write_text(json.dumps(progress)+"\n")
+            temp.replace(self.directory / "progress.json")
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        values = {k: float(v) for k, v in trainer.callback_metrics.items()
+                  if k.startswith("val_") and k.endswith("_epoch") and v.numel() == 1}
+        epoch = trainer.current_epoch + 1
+        record = dict(epoch=epoch, steps=trainer.global_step, seconds=time.monotonic()-self.started,
+                      completed=datetime.now(timezone.utc).isoformat(), **values)
+        out = self.directory / f"epoch_{epoch:03d}.json"
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, indent=2)+"\n")
+        tmp.replace(out)
+        _logger.info("Completed training epoch %d: %s", epoch, values)
+
 
 class SaveONNX(L.Callback):
     """

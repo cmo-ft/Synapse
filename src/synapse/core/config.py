@@ -222,6 +222,9 @@ class DataConfig(ConfigBase):
         'val_normalized_range': (bool, NoneType),
         'test_normalized_range': (bool, NoneType),
         'tree_name': (str, NoneType),
+        'batch_indexed': bool,
+        'normalization_chunk_size': int,
+        'root_read_chunk_size': int,
         'inputs': dict,
         'labels': dict,
         'selection': (str, NoneType),
@@ -468,6 +471,8 @@ class RunConfig(ConfigBase):
         'use_amp': bool,
         'checkpoint_dir': (str, NoneType),
         'test_output': (str, NoneType),
+        'stream_scores': bool,
+        'physics_epoch_log': bool,
         'binary_object_output_names': list,  # For older saved run configurations.
         'onnx_path': (str, NoneType),
         'export_onnx': (str, NoneType),

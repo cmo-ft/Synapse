@@ -1,5 +1,6 @@
 import copy
 import logging
+from contextlib import ExitStack
 
 import awkward as ak
 import numpy as np
@@ -7,7 +8,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from .tools import apply_selection, build_new_variables, extract_fields_from_expr
-from .fileio import read_files
+from .fileio import ROOTFileReader, read_files
 from .config import DataConfig
 
 _logger = logging.getLogger("SynapseLogger")
@@ -86,8 +87,14 @@ class MapStyleDataset(Dataset):
                 keys.extend(extract_fields_from_expr(expr))
         load_range = tuple(data_cfg.get(f'{dataset_type}_load_range', (0.0,1.0)))
         normalized_range = data_cfg.get(f'{dataset_type}_normalized_range', True)
-        raw_data, _ = read_files(file_list, list(set(keys)), load_range, normalized_range, merge=True, tree_name=data_cfg.get('tree_name'))
-        self.data = prepare_data(raw_data, data_cfg, dataset_type)
+        keys = list(set(keys))
+        chunk_size = data_cfg.get("root_read_chunk_size")
+        if chunk_size and not data_cfg.selection:
+            self.data = self._read_root_chunks(file_list, keys, load_range, normalized_range, chunk_size)
+        else:
+            raw_data, _ = read_files(file_list, keys, load_range, normalized_range, merge=True,
+                                     tree_name=data_cfg.get("tree_name"))
+            self.data = prepare_data(raw_data, data_cfg, dataset_type)
 
         lengths = [len(arr) for arr in self.data.values()]
         if len(set(lengths)) != 1:
@@ -105,6 +112,9 @@ class MapStyleDataset(Dataset):
         return mean
 
     def get_input_norm_dict(self):
+        chunk_size = self.data_cfg.get("normalization_chunk_size")
+        if chunk_size:
+            return self._chunked_input_norm(int(chunk_size))
         # (num_samples, num_evt_feats)
         ary_evt_feats = torch.tensor(self.data.get('evt_feats'))
         # (num_samples,)
@@ -135,10 +145,74 @@ class MapStyleDataset(Dataset):
 
 
 
+    def _read_root_chunks(self, paths, keys, load_range, normalized, chunk_size):
+        """Fill the in-memory training arrays without materializing an entire raw fold twice."""
+        if chunk_size < 1:
+            raise ValueError("ROOT read chunks must be positive")
+        columns = {}
+        offset = 0
+        with ExitStack() as stack:
+            readers = [stack.enter_context(ROOTFileReader(path, keys, self.data_cfg.get("tree_name"),
+                                                          load_range, normalized)) for path in paths]
+            count = sum(stop - start for start, stop in (reader.load_range for reader in readers))
+            for reader in readers:
+                start, stop = reader.load_range
+                for raw in reader.tree.iterate(filter_name=keys, entry_start=start, entry_stop=stop,
+                                               step_size=chunk_size, library="ak"):
+                    arrays = prepare_data(raw, self.data_cfg, self.dataset_type)
+                    if not columns:
+                        columns = {k: np.empty((count, *v.shape[1:]), dtype=v.dtype) for k, v in arrays.items()}
+                    for key, dest in columns.items():
+                        dest[offset:offset + len(raw)] = arrays[key]
+                    offset += len(raw)
+        if not columns or offset != count:
+            raise ValueError(f"Expected {count} ROOT rows, loaded {offset}")
+        return columns
+
+    def _chunked_input_norm(self, chunk_size):
+        if chunk_size < 1:
+            raise ValueError("Normalization chunks must be positive")
+        globals_ = self.data["evt_feats"]
+        objects = self.data["obj_feats"]
+        valid = self.data["mask"][:, 0, :]
+        weights = self.data[self.data_cfg.weight_key]
+        sums = [np.zeros(globals_.shape[1]), np.zeros(objects.shape[1])]
+        totals = np.zeros(2)
+        for start in range(0, len(weights), chunk_size):
+            chunk = slice(start, start + chunk_size)
+            w = weights[chunk].astype(np.float64)
+            ow = w[:, None] * valid[chunk]
+            totals += (w.sum(), ow.sum())
+            sums[0] += np.einsum("n,nf->f", w, globals_[chunk])
+            sums[1] += np.einsum("np,nfp->f", ow, objects[chunk])
+        if not np.all(np.isfinite(totals) & (totals > 0)):
+            raise ValueError("Normalization requires positive finite event and object weight")
+        means = [total / weight for total, weight in zip(sums, totals)]
+        variances = [np.zeros_like(mean) for mean in means]
+        for start in range(0, len(weights), chunk_size):
+            chunk = slice(start, start + chunk_size)
+            w = weights[chunk].astype(np.float64)
+            ow = w[:, None] * valid[chunk]
+            variances[0] += np.einsum("n,nf->f", w, np.square(globals_[chunk] - means[0]))
+            variances[1] += np.einsum("np,nfp->f", ow, np.square(objects[chunk] - means[1][:, None]))
+        return {key: {"mean": torch.tensor(mean, dtype=torch.float32),
+                      "std": torch.tensor(np.maximum(np.sqrt(v / total), 1.e-6), dtype=torch.float32)}
+                for key, mean, v, total in zip(("evt_feats", "obj_feats"), means, variances, totals)}
+
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
+        if isinstance(idx, (list, np.ndarray)):
+            # Advanced indexing already makes an independent, contiguous batch.
+            x = {key: self.data[key][idx] for key in self.data_cfg.inputs}
+            y = {key: self.data[key][idx] for key in self.data_cfg.final_label_keys}
+            if self.object_label_keys:
+                y["objects"] = {key: self.data[key][idx] for key in self.object_label_keys}
+            w = {self.data_cfg.weight_key: self.data[self.data_cfg.weight_key][idx]}
+            spectators = ({key: self.data[key][idx] for key in self.data_cfg.spectators}
+                          if self.dataset_type == "test" else {})
+            return x, y, w, spectators
         # Don't use np.ndarray.copy() here, as it will return a view of the original array in some cases
         # TODO: copy.deepcopy() is not efficient, consider using a more efficient method if needed
         x = {k: copy.deepcopy(self.data[k][idx]) for k in self.data_cfg.inputs.keys()}

@@ -3,6 +3,7 @@ from functools import cached_property
 
 import lightning as L
 import torch
+from torch.utils.data import BatchSampler, RandomSampler, SequentialSampler
 
 from .config import DataConfig, RunConfig
 from .dataset import MapStyleDataset #, HybridDataset
@@ -62,7 +63,15 @@ class DataModule(L.LightningDataModule):
                 self.test_data_cfg
             )
 
+    def _indexed_loader(self, dataset, shuffle):
+        sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
+        batches = BatchSampler(sampler, self.run_cfg.batch_size, drop_last=False)
+        return torch.utils.data.DataLoader(dataset, batch_size=None, sampler=batches,
+                                           num_workers=self.run_cfg.num_workers)
+
     def train_dataloader(self):
+        if self.train_data_cfg.get("batch_indexed"):
+            return self._indexed_loader(self.train_dataset, True)
         return torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=self.run_cfg.batch_size,
@@ -73,6 +82,8 @@ class DataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.val_data_cfg.get("batch_indexed"):
+            return self._indexed_loader(self.val_dataset, False)
         return torch.utils.data.DataLoader(
             self.val_dataset,
             batch_size=self.run_cfg.batch_size,
@@ -83,6 +94,8 @@ class DataModule(L.LightningDataModule):
         )
 
     def test_dataloader(self):
+        if self.test_data_cfg.get("batch_indexed"):
+            return self._indexed_loader(self.test_dataset, False)
         return torch.utils.data.DataLoader(
             self.test_dataset,
             batch_size=self.run_cfg.batch_size,

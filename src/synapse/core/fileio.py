@@ -61,7 +61,6 @@ class FileReaderBase(ABC):
         self.file_path = file_path
         self.keys = keys
         self.normalized_range = normalized_range
-        self.file = None
         self.data = None
 
     @abstractmethod

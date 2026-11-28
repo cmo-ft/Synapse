@@ -943,9 +943,17 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                  shared_parent_rank=None,
                  num_shared_parent_types=4,
                  shared_parent_feedback=None,
+                 ancestry_outputs=None,
+                 wz_recoil=False,
+                 standardization_clip=None,
+                 global_input_batchnorm=True,
                  **kwargs) -> None:
         super().__init__(input_dim, global_input_dim, **kwargs)
 
+        self.standardization_clip = standardization_clip
+        self.ancestry_outputs = tuple(ancestry_outputs or ())
+        if self.ancestry_outputs and not shared_parent_feedback:
+            raise ValueError("Ancestry outputs require a penultimate shared-parent head")
         # Jet candidates and per-object truth IDs need the original slot ordering.
         use_lepton_heads = lepton_jet_hf is not None
         self.trimmer = SequenceTrimmer(
@@ -1035,6 +1043,14 @@ class ParticleTransformerSimple(_NormalizedTransformer):
         self.shared_parent_head = None
         if shared_parent_rank is not None:
             self.shared_parent_head = SharedParentHead(embed_dim, shared_parent_rank, num_shared_parent_types, feedback_heads)
+        if not global_input_batchnorm and len(global_embed_dims):
+            self.global_embed.input_bn = None
+        self.ancestry_head = (nn.Linear(embed_dim, len(self.ancestry_outputs)) if self.ancestry_outputs else None)
+        self.wz_recoil = None
+        if wz_recoil:
+            from .wz_recoil import WZRecoil
+            self.wz_recoil = WZRecoil()
+            self.recoil_projection = nn.Linear(1, 2*embed_dim, bias=False)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
@@ -1052,7 +1068,7 @@ class ParticleTransformerSimple(_NormalizedTransformer):
     def no_weight_decay(self):
         return {'cls_token', }
 
-    def forward(self, x, g, v=None, mask=None, uu=None, uu_idx=None):
+    def forward(self, x, g, v=None, mask=None, uu=None, uu_idx=None, detach_relation_inputs=False):
         # x: (N, C, P)
         # g: (N, C) -- global feature
         # v: (N, 4, P) [px,py,pz,energy]
@@ -1062,6 +1078,9 @@ class ParticleTransformerSimple(_NormalizedTransformer):
 
         raw_features = x
         x, g = self.normalize_inputs(x, g)
+        if self.standardization_clip is not None:
+            x = x.clamp(-self.standardization_clip, self.standardization_clip)
+            g = g.clamp(-self.standardization_clip, self.standardization_clip)
 
         with torch.no_grad():
             if not self.for_inference:
@@ -1079,10 +1098,16 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                 attn_mask = self.pair_embed(v, uu).flatten(0, 1)  # (N*num_heads, P, P)
 
             shared_parent_logits = None
+            aux = {}
             for index, block in enumerate(self.blocks):
                 if self.shared_parent_veto_indices is not None and index == len(self.blocks) - 1:
                     # Use the penultimate block's predictions for both the pair loss and the last block's attention.
-                    shared_parent_logits = self.shared_parent_head(x.transpose(0, 1))  # [batch, parent, object, object]
+                    tokens = x.transpose(0, 1)
+                    if detach_relation_inputs:
+                        tokens = tokens.detach()
+                    shared_parent_logits = self.shared_parent_head(tokens)
+                    if self.ancestry_head is not None:
+                        aux["ancestry_logits"] = self.ancestry_head(tokens)
                     veto_flags = (raw_features[:, i] for i in self.shared_parent_veto_indices)
                     eligible = shared_parent_object_mask(~padding_mask, veto_flags)
                     shared_parent_bias = self.shared_parent_head.attention_bias(shared_parent_logits, eligible)
@@ -1111,10 +1136,15 @@ class ParticleTransformerSimple(_NormalizedTransformer):
                 if self.hf_event_projection is not None:
                     # Add the pooled jet context to the [CLS, global] features before predicting the event class.
                     x_cls = x_cls + self.hf_event_projection(event_jet_context)
+            if self.wz_recoil is not None:
+                recoil = self.wz_recoil.score_event(raw_features, v, mask)
+                aux["wz_recoil"] = recoil
+                x_cls = x_cls + self.recoil_projection(recoil.tanh().unsqueeze(1))
             output = self.fc(x_cls)
             if self.shared_parent_head is not None and shared_parent_logits is None:
                 # Recipes using the matrices only for supervision predict them from the final tokens.
                 shared_parent_logits = self.shared_parent_head(tokens)
-            aux = {"shared_parent_logits": shared_parent_logits} if shared_parent_logits is not None else None
-            return output, aux, obj_output.reshape(-1, self.num_obj_classes)
+            if shared_parent_logits is not None:
+                aux["shared_parent_logits"] = shared_parent_logits
+            return output, aux or None, obj_output.reshape(-1, self.num_obj_classes)
 

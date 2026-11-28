@@ -14,6 +14,32 @@ from synapse.models.shared_parent import SharedParentHead
 
 
 class SharedParentTests(unittest.TestCase):
+    def test_explicit_higgs_pairs_train_with_ambiguous_ids_and_apply_vetoes(self):
+        # The two events have no unique instance IDs. Only the first has real supervised pairs.
+        loss = EventAndLeptonObjectLoss(origin_loss_weight=0, conversion_loss_weight=0,
+            heavy_flavour_weight=0, balance_origin_classes=False, shared_parent_loss_weight=1,
+            shared_parent_branches=["relationHiggs"],
+            explicit_parent_pairs={"relationHiggs": ("known", "same")})
+        shape = (2, 5)
+        target = {key: torch.zeros(shape, dtype=torch.int16)
+                  for key in ("known", "same", "isMET", "isLepton", "partOrigin", "isConv", "isHF")}
+        target["relationHiggs"] = torch.full(shape, -1)
+        target["isMET"][:, 3] = 1
+        target["known"][:, 0] = torch.tensor([30, 24])
+        target["same"][0, 0] = 2
+        valid = torch.tensor([[[True, True, True, True, False]]]).repeat(2, 1, 1)
+        weights = torch.tensor([1., 3.])
+        loss.prepare_training_fold(target, valid, weights)
+        self.assertEqual(float(loss.shared_parent_factors[0]), 4.)
+        pairs = torch.zeros(2, 1, 5, 5, requires_grad=True)
+        pred = (torch.zeros(2, 3), {"shared_parent_logits": pairs}, torch.zeros(10, 5))
+        value, _ = loss(pred, torch.zeros(2, dtype=torch.long), weights, object_targets=target, object_mask=valid)
+        value.backward()
+        want = torch.zeros_like(pairs)
+        want[0, 0, 0, 1] = -.25
+        want[0, 0, 0, 2] = .25
+        torch.testing.assert_close(pairs.grad, want)
+
     def test_earlier_recipe_and_checkpoint_restore_the_shared_parent_head(self):
         branches = {"relationZ": "p_pair_z", "relationHiggs": "p_pair_higgs"}
         recipe = {
