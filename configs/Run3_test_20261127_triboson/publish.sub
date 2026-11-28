@@ -1,0 +1,18 @@
+universe = vanilla
+batch_name = Run3_test_20261127_triboson_publish
+executable = /bin/bash
+arguments = /eos/home-c/cmo/project/HHML/FullRun2Run3/mva/Synapse/run_dir/Run3_test_20261127_triboson/diagnostics/prepare_worker.sh /eos/home-c/cmo/project/HHML/FullRun2Run3/mva/Synapse/run_dir/Run3_test_20261127_triboson /eos/home-c/cmo/project/HHML/FullRun2Run3/mva/Synapse/run_dir/Run3_test_20261127_parent_present
+initialdir = /afs/cern.ch/user/c/cmo/private/workspace/hhml/submit-synapse/Run3_test_20261127_triboson
+log = /afs/cern.ch/user/c/cmo/private/workspace/hhml/submit-synapse/Run3_test_20261127_triboson/publish_$(ClusterId).log
+output = /afs/cern.ch/user/c/cmo/private/workspace/hhml/submit-synapse/Run3_test_20261127_triboson/publish_$(ClusterId).out
+error = /afs/cern.ch/user/c/cmo/private/workspace/hhml/submit-synapse/Run3_test_20261127_triboson/publish_$(ClusterId).err
+should_transfer_files = YES
+transfer_executable = False
+transfer_output_files = ""
+when_to_transfer_output = ON_EXIT
+MY.SendCredential = True
+request_disk = 5000M
+request_cpus = 2
+request_memory = 4500M
++JobFlavour = "longlunch"
+queue 1
