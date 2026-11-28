@@ -26,6 +26,11 @@ pip install -e .
 
 ### Usage
 
+The Run 3 HH three-lepton reference is the five-block `parent_present` ParT. Its fold 1
+recipe documents the scientific changes since `0073327`, how to train or score a
+published dataset, and how to read the portable validation and test results.
+[Parent-present recipe and result guide](configs/Run3_test_20261127_parent_present/README.md)
+
 For the six-central-jet ParT trained on three MC truth classes, see the [v06 fold-0 training configuration](configs/v06_test_run3/).
 
 #### For HHML analysis
